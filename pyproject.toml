@@ -1,0 +1,116 @@
+[build-system]
+requires = ["hatchling>=1.27", "hatch-vcs>=0.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sunday-python"
+dynamic = ["version"]
+description = "Sunday HTTP runtime for generated Python clients and servers"
+readme = "README.md"
+requires-python = ">=3.12,<4"
+license = "Apache-2.0"
+license-files = ["LICENSE.txt"]
+authors = [{ name = "Outfox, Inc." }]
+keywords = ["api", "http", "openapi", "raml", "asyncapi", "sse"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+dependencies = [
+  "pydantic>=2.12,<3",
+]
+
+[project.optional-dependencies]
+httpx = [
+  "anyio>=4,<5",
+  "httpx>=0.28,<1",
+]
+litestar = [
+  "litestar>=2.18,<3",
+]
+cbor = [
+  "cbor2>=6,<7",
+]
+all = [
+  "anyio>=4,<5",
+  "cbor2>=6,<7",
+  "httpx>=0.28,<1",
+  "litestar>=2.18,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/outfoxx/sunday-python"
+Issues = "https://github.com/outfoxx/sunday-python/issues"
+Repository = "https://github.com/outfoxx/sunday-python"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.18,<2",
+  "pytest>=9,<10",
+  "pytest-cov>=7,<8",
+  "ruff>=0.14,<1",
+  "twine>=6,<7",
+  "sunday-python[all]",
+]
+
+[tool.uv.sources]
+sunday-python = { workspace = true }
+
+[tool.uv.workspace]
+members = ["."]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+fallback_version = "2.0.0.dev0"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/sunday/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sunday"]
+core-metadata-version = "2.4"
+
+[tool.hatch.build.targets.sdist]
+core-metadata-version = "2.4"
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+pretty = false
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "anyio: run an asynchronous test with AnyIO",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["sunday"]
+omit = ["src/sunday/_version.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 90

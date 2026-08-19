@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked --all-extras
+      - run: uv run ruff format --check src tests
+      - run: uv run ruff check src tests
+      - run: uv run mypy src tests
+      - run: uv run pytest --cov=sunday --cov-report=term-missing
+
+  minimum-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv venv --python 3.12 .venv-minimum
+      - run: uv pip install --python .venv-minimum/bin/python --resolution lowest-direct ".[all]" "pytest>=9.0"
+      - run: .venv-minimum/bin/python -m pytest
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --all-extras
+      - run: uv build
+      - run: uv run twine check dist/*
+      - name: Smoke built wheel
+        run: |
+          wheel="$(find dist -name '*.whl' -print -quit)"
+          uv run --isolated --with "$wheel" --with httpx --with litestar --with cbor2 \
+            python -c "import sunday; import sunday.httpx; import sunday.litestar; import sunday.cbor; print(sunday.__version__)"

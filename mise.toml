@@ -1,0 +1,24 @@
+[tools]
+python = "3.12"
+uv = "latest"
+
+[tasks.check]
+depends = ["format-check", "lint", "typecheck", "test", "build"]
+
+[tasks.format]
+run = "uv run ruff format src tests"
+
+[tasks.format-check]
+run = "uv run ruff format --check src tests"
+
+[tasks.lint]
+run = "uv run ruff check src tests"
+
+[tasks.typecheck]
+run = "uv run mypy src tests"
+
+[tasks.test]
+run = "uv run pytest --cov=sunday --cov-report=term-missing"
+
+[tasks.build]
+run = "uv build"

@@ -1,0 +1,11 @@
+.venv/
+dist/
+build/
+reports/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+src/sunday/_version.py
