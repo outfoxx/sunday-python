@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
+from types import TracebackType
 from typing import TYPE_CHECKING
 
 import anyio
@@ -44,6 +45,22 @@ class HttpxEventStream[EventT]:
     def __aiter__(self) -> AsyncIterator[EventT]:
         return self.events()
 
+    async def __aenter__(self) -> HttpxEventStream[EventT]:
+        """Enter an asynchronous event-stream lifecycle scope."""
+        if self._closed:
+            raise RuntimeError("HttpxEventStream is closed")
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the event stream when leaving its lifecycle scope."""
+        del exc_type, exc_value, traceback
+        await self.aclose()
+
     async def aclose(self) -> None:
         """Close the active response and interrupt reads or retry waits."""
         self._closed = True
@@ -65,7 +82,6 @@ class HttpxEventStream[EventT]:
         retry_max = max(retry, self._options.retry_max)
         retry_attempt = 0
         last_event_id: str | None = None
-        event_timeout = self._options.event_timeout
 
         try:
             with anyio.CancelScope() as cancel_scope:
@@ -91,29 +107,28 @@ class HttpxEventStream[EventT]:
                         retry_attempt = 0
 
                         parser = EventParser()
-                        timeout_state = [event_timeout]
+                        timeout_state = [self._options.event_timeout]
 
                         def current_timeout(state: list[float | None] = timeout_state) -> float | None:
                             return state[0]
 
                         async for chunk in self._chunks(response, current_timeout):
                             for event in parser.feed(chunk):
-                                retry, retry_max, event_timeout, last_event_id = self._apply_controls(
+                                retry, retry_max, timeout_state[0], last_event_id = self._apply_controls(
                                     event,
                                     retry,
                                     retry_max,
-                                    event_timeout,
+                                    timeout_state[0],
                                     last_event_id,
                                 )
-                                timeout_state[0] = event_timeout
                                 if event.data is not None:
                                     yield self._decoder(event)
                         for event in parser.finalize():
-                            retry, retry_max, event_timeout, last_event_id = self._apply_controls(
+                            retry, retry_max, timeout_state[0], last_event_id = self._apply_controls(
                                 event,
                                 retry,
                                 retry_max,
-                                event_timeout,
+                                timeout_state[0],
                                 last_event_id,
                             )
                             if event.data is not None:

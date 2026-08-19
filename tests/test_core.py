@@ -16,6 +16,7 @@ from sunday import (
     ResponseHeaders,
     SundayModel,
     TolerantStrEnum,
+    URITemplate,
 )
 
 
@@ -123,3 +124,17 @@ def test_problem_registry_rejects_non_problem_types() -> None:
 
     with pytest.raises(TypeError):
         registry.register("invalid", Project)  # type: ignore[arg-type]
+
+
+def test_uri_template_expands_defaults_overrides_and_reserved_values() -> None:
+    template = URITemplate(
+        "https://api.example.test/{version}/projects{?tags*}{+fragment}",
+        {"version": "v1", "tags": ["one", "two"]},
+    )
+
+    assert template.expand(fragment="/a/b") == "https://api.example.test/v1/projects?tags=one&tags=two/a/b"
+    assert template.expand({"version": "v2", "tags": None}, fragment="") == "https://api.example.test/v2/projects"
+    assert str(URITemplate("https://api.example.test/{version}", {"version": "v1"})) == "https://api.example.test/v1"
+    assert URITemplate("https://api.example.test/root").resolve("items/{id}").expand(id="one") == (
+        "https://api.example.test/root/items/one"
+    )

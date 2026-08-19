@@ -13,7 +13,7 @@ Install only the adapters required by the generated project:
 ```shell
 pip install "sunday-python[httpx]"
 pip install "sunday-python[litestar]"
-pip install "sunday-python[httpx,litestar,cbor]"
+pip install "sunday-python[httpx,litestar,cbor,xml,yaml]"
 ```
 
 The distribution is named `sunday-python`; public APIs are imported from `sunday`.
@@ -28,3 +28,4 @@ mise run check
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the validation and release rules.
+The [parity matrix](docs/parity.md) records the generator IR boundary and intentional exclusions for the first beta.

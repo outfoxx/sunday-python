@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from time import monotonic
+from types import TracebackType
 from typing import Any, Protocol, TypeVar
 
 import anyio
@@ -17,6 +17,8 @@ from .codecs import JsonCodec, MediaTypeDecoders, MediaTypeEncoders
 from .errors import SundayError, UnexpectedResponse
 from .headers import ResponseHeaders
 from .media import MediaType
+from .multipart import MultipartBody
+from .observers import TransportEvent, TransportEventKind, TransportObserver, redact_headers
 from .operations import OperationResponse
 from .parameters import encode_parameters
 from .problems import Problem, ProblemRegistry
@@ -35,75 +37,10 @@ class HttpxRequestAdapter(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
-class TokenAuthorization:
-    """A header token and its optional expiration time."""
-
-    token: str
-    expires_at: datetime | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class StaticHeaderTokenAuthorizingAdapter:
-    """Adds a static token to a request header."""
-
-    token: str
-    header_name: str = "Authorization"
-    scheme: str | None = "Bearer"
-
-    async def adapt(self, transport: HttpxTransport, request: httpx.Request) -> httpx.Request:
-        """Add the configured static token header to ``request``."""
-        del transport
-        request.headers[self.header_name] = _authorization_value(self.token, self.scheme)
-        return request
-
-
-class RefreshingHeaderTokenAuthorizingAdapter:
-    """Caches and refreshes header-token authorization using an async provider."""
-
-    def __init__(
-        self,
-        provider: Callable[[], Awaitable[TokenAuthorization]],
-        *,
-        header_name: str = "Authorization",
-        scheme: str | None = "Bearer",
-        refresh_skew: timedelta = timedelta(seconds=30),
-    ) -> None:
-        self._provider = provider
-        self._header_name = header_name
-        self._scheme = scheme
-        self._refresh_skew = refresh_skew
-        self._authorization: TokenAuthorization | None = None
-        self._lock = anyio.Lock()
-
-    async def adapt(self, transport: HttpxTransport, request: httpx.Request) -> httpx.Request:
-        """Add a cached or freshly obtained token header to ``request``."""
-        del transport
-        authorization = await self._current_authorization()
-        request.headers[self._header_name] = _authorization_value(authorization.token, self._scheme)
-        return request
-
-    async def _current_authorization(self) -> TokenAuthorization:
-        if self._is_current(self._authorization):
-            authorization = self._authorization
-            assert authorization is not None
-            return authorization
-        async with self._lock:
-            if not self._is_current(self._authorization):
-                self._authorization = await self._provider()
-            authorization = self._authorization
-            assert authorization is not None
-            return authorization
-
-    def _is_current(self, authorization: TokenAuthorization | None) -> bool:
-        if authorization is None:
-            return False
-        if authorization.expires_at is None:
-            return True
-        expires_at = authorization.expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-        return datetime.now(UTC) + self._refresh_skew < expires_at
+type HttpxRequestAdapterCallable = Callable[
+    [HttpxTransport, httpx.Request],
+    Awaitable[httpx.Request | None],
+]
 
 
 class HttpxTransport:
@@ -116,13 +53,20 @@ class HttpxTransport:
         problem_registry: ProblemRegistry | None = None,
         encoders: MediaTypeEncoders | None = None,
         decoders: MediaTypeDecoders | None = None,
-        adapters: Sequence[HttpxRequestAdapter] = (),
+        adapters: Sequence[HttpxRequestAdapter | HttpxRequestAdapterCallable] = (),
+        observers: Sequence[TransportObserver] = (),
+        sensitive_headers: Sequence[str] = (),
+        close_client: bool = False,
     ) -> None:
         self.client = client
         self.problem_registry = problem_registry or ProblemRegistry()
         self.encoders = encoders or MediaTypeEncoders.defaults()
         self.decoders = decoders or MediaTypeDecoders.defaults()
         self.adapters = tuple(adapters)
+        self.observers = tuple(observers)
+        self.sensitive_headers = tuple(sensitive_headers)
+        self.close_client = close_client
+        self._closed = False
 
     def register_problem(self, type_uri: str, problem_type: type[Problem]) -> None:
         """Register a generated problem exception for response decoding."""
@@ -144,8 +88,13 @@ class HttpxTransport:
             headers["accept"] = ", ".join(str(media_type) for media_type in spec.accept_types)
 
         content: Any = None
-        if isinstance(spec.body, StreamingBody):
-            streaming_content = spec.body.content()
+        body = spec.effective_body
+        content_types = spec.effective_content_types
+        if isinstance(body, MultipartBody):
+            content = body.content()
+            headers["content-type"] = str(body.content_type)
+        elif isinstance(body, StreamingBody):
+            streaming_content = body.content()
             if isinstance(streaming_content, (bytes, AsyncIterable)):
                 content = streaming_content
             else:
@@ -156,25 +105,63 @@ class HttpxTransport:
                         yield chunk
 
                 content = async_content()
-            if spec.content_types and "content-type" not in headers:
-                headers["content-type"] = str(spec.content_types[0])
-        elif spec.body is not None:
-            content_type = spec.content_types[0] if spec.content_types else MediaType("application/json")
+            if content_types and "content-type" not in headers:
+                headers["content-type"] = str(content_types[0])
+        elif body is not None:
+            content_type = content_types[0] if content_types else MediaType("application/json")
             encoder = self.encoders.find(content_type)
             if encoder is None:
                 raise SundayError(f"No request encoder supports {content_type}")
-            content = encoder.encode(spec.body)
+            content = encoder.encode(body)
             if "content-type" not in headers:
                 headers["content-type"] = str(content_type)
 
-        request = self.client.build_request(spec.method.upper(), path, headers=headers, content=content)
-        for adapter in self.adapters:
-            request = await adapter.adapt(self, request)
-        return request
+        return self.client.build_request(spec.method.upper(), path, headers=headers, content=content)
 
     async def send(self, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
         """Send a native HTTPX request."""
-        return await self.client.send(request, stream=stream)
+        if self._closed:
+            raise RuntimeError("HttpxTransport is closed")
+        for adapter in self.adapters:
+            adapt = getattr(adapter, "adapt", None)
+            adapted = await adapt(self, request) if adapt is not None else await adapter(self, request)  # type: ignore[operator]
+            if adapted is not None:
+                request = adapted
+
+        started = monotonic()
+        self._observe(
+            TransportEvent(
+                TransportEventKind.REQUEST,
+                request.method,
+                str(request.url),
+                redact_headers(request.headers.multi_items(), self.sensitive_headers),
+            )
+        )
+        try:
+            response = await self.client.send(request, stream=stream)
+        except BaseException as error:
+            self._observe(
+                TransportEvent(
+                    TransportEventKind.FAILURE,
+                    request.method,
+                    str(request.url),
+                    (),
+                    elapsed=monotonic() - started,
+                    error=error,
+                )
+            )
+            raise
+        self._observe(
+            TransportEvent(
+                TransportEventKind.RESPONSE,
+                request.method,
+                str(request.url),
+                redact_headers(response.headers.multi_items(), self.sensitive_headers),
+                status=response.status_code,
+                elapsed=monotonic() - started,
+            )
+        )
+        return response
 
     async def decode_response(
         self,
@@ -183,6 +170,18 @@ class HttpxTransport:
     ) -> OperationResponse[Any]:
         """Decode a successful response or raise its typed problem."""
         body = await response.aread()
+        try:
+            return self._decode_buffered_response(response, body, responses)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await response.aclose()
+
+    def _decode_buffered_response(
+        self,
+        response: httpx.Response,
+        body: bytes,
+        responses: Sequence[ResponseSpec[Any]],
+    ) -> OperationResponse[Any]:
         if not 200 <= response.status_code < 300:
             self.raise_problem(response, body)
 
@@ -198,7 +197,8 @@ class HttpxTransport:
             response_spec = next((item for item in candidates if not item.body_expected), None)
             if response_spec is None and response.status_code not in {204, 205}:
                 raise self._unexpected(response, body, "Expected a response body")
-            return OperationResponse(None, response, response.status_code, headers)
+            decoded_headers = self._decode_headers(response_spec, headers, response, body) if response_spec else {}
+            return OperationResponse(None, response, response.status_code, headers, decoded_headers)
 
         response_spec = next((item for item in candidates if item.accepts(content_type)), None)
         if response_spec is None:
@@ -211,7 +211,29 @@ class HttpxTransport:
             raise self._unexpected(response, body, "No decoder supports the response media type")
         decoded = decoder.decode(body, content_type)
         result = response_spec.decoder(decoded) if response_spec.decoder is not None else decoded
-        return OperationResponse(result, response, response.status_code, headers)
+        decoded_headers = self._decode_headers(response_spec, headers, response, body)
+        return OperationResponse(result, response, response.status_code, headers, decoded_headers)
+
+    def _decode_headers(
+        self,
+        spec: ResponseSpec[Any],
+        headers: ResponseHeaders,
+        response: httpx.Response,
+        body: bytes,
+    ) -> dict[str, object]:
+        decoded: dict[str, object] = {}
+        for header in spec.headers:
+            values = headers.get_all(header.name)
+            if not values:
+                if header.required:
+                    raise self._unexpected(response, body, f"Required response header is missing: {header.name}")
+                continue
+            try:
+                converted = tuple(header.decoder(value) if header.decoder is not None else value for value in values)
+            except (TypeError, ValueError) as error:
+                raise self._unexpected(response, body, f"Invalid response header {header.name}: {error}") from error
+            decoded[header.name] = converted if header.repeated else converted[0]
+        return decoded
 
     def raise_problem(self, response: httpx.Response, body: bytes) -> None:
         """Raise a typed problem or an unexpected-response error."""
@@ -254,14 +276,38 @@ class HttpxTransport:
             transport_response=response,
         )
 
+    def _observe(self, event: TransportEvent) -> None:
+        for observer in self.observers:
+            observer.observe(event)
+
+    async def aclose(self) -> None:
+        """Close the transport and optionally its HTTPX client exactly once."""
+        if self._closed:
+            return
+        self._closed = True
+        if self.close_client:
+            await self.client.aclose()
+
+    async def __aenter__(self) -> HttpxTransport:
+        """Enter an asynchronous transport lifecycle scope."""
+        if self._closed:
+            raise RuntimeError("HttpxTransport is closed")
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close transport-owned resources when leaving a lifecycle scope."""
+        del exc_type, exc_value, traceback
+        await self.aclose()
+
 
 def as_httpx_transport(value: HttpxTransport | httpx.AsyncClient) -> HttpxTransport:
     """Preserve the beta constructor contract by wrapping raw HTTPX clients."""
     return value if isinstance(value, HttpxTransport) else HttpxTransport(value)
-
-
-def _authorization_value(token: str, scheme: str | None) -> str:
-    return f"{scheme} {token}" if scheme else token
 
 
 from .httpx_sse import HttpxEventStream  # noqa: E402

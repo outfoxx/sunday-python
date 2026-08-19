@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-
 import httpx
 import pytest
 from pydantic import TypeAdapter
@@ -20,15 +18,15 @@ from sunday import (
     Problem,
     ProblemPayload,
     RequestSpec,
+    ResponseHeaderSpec,
     ResponseSpec,
     StreamingBody,
+    TransportEvent,
+    TransportEventKind,
     UnexpectedResponse,
 )
 from sunday.httpx import (
     HttpxTransport,
-    RefreshingHeaderTokenAuthorizingAdapter,
-    StaticHeaderTokenAuthorizingAdapter,
-    TokenAuthorization,
     as_httpx_transport,
 )
 
@@ -42,12 +40,30 @@ class ConflictProblem(Problem):
     payload_type = ConflictPayload
 
 
+class RecordingObserver:
+    def __init__(self) -> None:
+        self.events: list[TransportEvent] = []
+
+    def observe(self, event: TransportEvent) -> None:
+        self.events.append(event)
+
+
 @pytest.mark.anyio
 async def test_build_request_encodes_parameters_body_headers_and_cookies() -> None:
-    async with httpx.AsyncClient(base_url="https://api.example.test") as client:
+    async def bearer(_transport: HttpxTransport, request: httpx.Request) -> httpx.Request:
+        request.headers["Authorization"] = "Bearer token"
+        return request
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        base_url="https://api.example.test",
+        transport=httpx.MockTransport(handler),
+    ) as client:
         transport = HttpxTransport(
             client,
-            adapters=(StaticHeaderTokenAuthorizingAdapter("token"),),
+            adapters=(bearer,),
         )
         request = await transport.build_request(
             RequestSpec(
@@ -65,6 +81,8 @@ async def test_build_request_encodes_parameters_body_headers_and_cookies() -> No
                 accept_types=(MediaType("application/vnd.project+json"),),
             )
         )
+        assert "authorization" not in request.headers
+        await transport.send(request)
 
     assert str(request.url) == "https://api.example.test/projects/a%2Fb?tag=one&tag=two"
     assert request.headers["x-trace"] == "trace-1"
@@ -134,6 +152,7 @@ async def test_response_decoding_selects_status_media_and_decoder() -> None:
     assert response.result == {"id": "one"}
     assert response.status == 200
     assert response.get_header("content-type") == "application/vnd.project+json"
+    assert response.transport_response.is_closed
 
 
 @pytest.mark.anyio
@@ -215,23 +234,73 @@ async def test_unexpected_responses_preserve_diagnostics() -> None:
 
 
 @pytest.mark.anyio
-async def test_refreshing_authorization_caches_until_expiration() -> None:
-    calls = 0
+async def test_response_decodes_declared_headers() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers=[("Content-Type", "application/json"), ("X-Count", "42"), ("X-Tag", "a"), ("X-Tag", "b")],
+            json={"ok": True},
+        )
 
-    async def provider() -> TokenAuthorization:
-        nonlocal calls
-        calls += 1
-        return TokenAuthorization(f"token-{calls}", datetime.now(UTC) + timedelta(hours=1))
+    async with httpx.AsyncClient(
+        base_url="https://api.example.test",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        operation = Operation[dict[str, bool]](
+            HttpxTransport(client),
+            OperationSpec(
+                RequestSpec("GET", "/value"),
+                (
+                    ResponseSpec(
+                        200,
+                        (MediaType("application/json"),),
+                        TypeAdapter(dict[str, bool]).validate_python,
+                        headers=(
+                            ResponseHeaderSpec("X-Count", int, required=True),
+                            ResponseHeaderSpec("X-Tag", repeated=True),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        response = await operation.response()
 
-    async with httpx.AsyncClient(base_url="https://api.example.test") as client:
-        adapter = RefreshingHeaderTokenAuthorizingAdapter(provider, scheme=None)
-        transport = HttpxTransport(client, adapters=(adapter,))
-        first = await transport.build_request(RequestSpec("GET", "/one"))
-        second = await transport.build_request(RequestSpec("GET", "/two"))
+    assert response.decoded_header("x-count") == 42
+    assert response.decoded_header("X-Tag") == ("a", "b")
 
-    assert first.headers["authorization"] == "token-1"
-    assert second.headers["authorization"] == "token-1"
-    assert calls == 1
+
+@pytest.mark.anyio
+async def test_request_adapters_are_ordered_and_observation_is_redacted() -> None:
+    observer = RecordingObserver()
+
+    class FirstAdapter:
+        async def adapt(self, _transport: HttpxTransport, request: httpx.Request) -> httpx.Request:
+            request.headers["X-Order"] = "first"
+            return request
+
+    async def second(_transport: HttpxTransport, request: httpx.Request) -> None:
+        request.headers["X-Order"] += ",second"
+        request.headers["Authorization"] = "Bearer secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-Order"] == "first,second"
+        assert request.headers["Authorization"] == "Bearer secret"
+        return httpx.Response(204, headers={"Set-Cookie": "session=secret"})
+
+    async with httpx.AsyncClient(
+        base_url="https://api.example.test",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        transport = HttpxTransport(client, adapters=(FirstAdapter(), second), observers=(observer,))
+        await transport.send(await transport.build_request(RequestSpec("GET", "/value")))
+        await transport.aclose()
+        await transport.aclose()
+        with pytest.raises(RuntimeError):
+            await transport.send(await transport.build_request(RequestSpec("GET", "/closed")))
+
+    assert [event.kind for event in observer.events] == [TransportEventKind.REQUEST, TransportEventKind.RESPONSE]
+    assert dict(observer.events[0].headers)["authorization"] == "<redacted>"
+    assert dict(observer.events[1].headers)["set-cookie"] == "<redacted>"
 
 
 def test_as_httpx_transport_preserves_existing_transport() -> None:

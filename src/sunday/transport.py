@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from types import TracebackType
 from typing import Any, Protocol
 
 from .operations import OperationResponse
@@ -29,4 +30,21 @@ class Transport(Protocol):
         responses: Sequence[ResponseSpec[Any]],
     ) -> OperationResponse[Any]:
         """Decode a native response according to generated response specifications."""
+        ...
+
+    async def aclose(self) -> None:
+        """Release transport-owned resources idempotently."""
+        ...
+
+    async def __aenter__(self) -> Transport:
+        """Enter an asynchronous transport lifecycle scope."""
+        ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Release transport-owned resources when leaving a lifecycle scope."""
         ...

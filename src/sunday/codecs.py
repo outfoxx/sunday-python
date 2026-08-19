@@ -9,7 +9,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Protocol
 from urllib.parse import urlencode
 from uuid import UUID
@@ -17,6 +17,14 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from .media import MediaType
+
+
+class WireMode(StrEnum):
+    """Controls how models distinguish absent values from explicit ``None``."""
+
+    REQUEST = "request"
+    RESPONSE = "response"
+    PATCH = "patch"
 
 
 class MediaTypeEncoder(Protocol):
@@ -110,10 +118,11 @@ class JsonCodec:
     """JSON request and response codec, including structured JSON suffixes."""
 
     media_types: tuple[MediaType, ...] = (MediaType("application/json"), MediaType("application/*+json"))
+    wire_mode: WireMode = WireMode.REQUEST
 
     def encode(self, value: object) -> bytes:
         """Encode ``value`` as compact UTF-8 JSON."""
-        return json.dumps(_json_value(value), separators=(",", ":"), ensure_ascii=False).encode()
+        return json.dumps(_json_value(value, self.wire_mode), separators=(",", ":"), ensure_ascii=False).encode()
 
     def decode(self, value: bytes, media_type: MediaType) -> object:
         """Decode UTF-8 JSON bytes into Python values."""
@@ -175,15 +184,20 @@ class FormUrlEncodedCodec:
         return parse_qs(value.decode(charset), keep_blank_values=True)
 
 
-def _json_value(value: object) -> object:
+def _json_value(value: object, wire_mode: WireMode = WireMode.REQUEST) -> object:
+    sunday_wire = getattr(value, "__sunday_wire__", None)
+    if callable(sunday_wire):
+        return sunday_wire()
     if isinstance(value, BaseModel):
+        if wire_mode in {WireMode.REQUEST, WireMode.PATCH}:
+            return value.model_dump(mode="json", by_alias=True, exclude_unset=True)
         return value.model_dump(mode="json", by_alias=True, exclude_none=True)
     if isinstance(value, Enum):
-        return _json_value(value.value)
+        return _json_value(value.value, wire_mode)
     if isinstance(value, (datetime, date, time, UUID)):
         return str(value)
     if isinstance(value, Mapping):
-        return {str(key): _json_value(item) for key, item in value.items()}
+        return {str(key): _json_value(item, wire_mode) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview)):
-        return [_json_value(item) for item in value]
+        return [_json_value(item, wire_mode) for item in value]
     return value

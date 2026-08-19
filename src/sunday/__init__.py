@@ -20,11 +20,14 @@ from .codecs import (
     MediaTypeEncoder,
     MediaTypeEncoders,
     TextCodec,
+    WireMode,
 )
 from .errors import SundayError, UnexpectedResponse
 from .headers import ResponseHeaders
 from .media import MediaType
 from .models import SundayModel, TolerantStrEnum
+from .multipart import MultipartBody, MultipartContent, MultipartPart
+from .observers import LoggingTransportObserver, TransportEvent, TransportEventKind, TransportObserver
 from .operations import NullableOperation, Operation, OperationResponse, StreamingOperation
 from .parameters import (
     EncodedParameters,
@@ -34,11 +37,13 @@ from .parameters import (
     encode_parameters,
     parameter_value,
 )
+from .patch import MergePatch, PatchDocument, PatchOperation, PatchOperationKind
 from .problems import Problem, ProblemPayload, ProblemRegistry
-from .specs import NullifySpec, OperationSpec, RequestSpec, ResponseSpec
+from .specs import NullifySpec, OperationSpec, RequestPayloadSpec, RequestSpec, ResponseHeaderSpec, ResponseSpec
 from .sse import EventParser, EventStreamOptions, ServerSentEvent
-from .streaming import StreamingBody, StreamingBodyChunk, StreamingBodyContent
+from .streaming import StreamingBody, StreamingBodyChunk, StreamingBodyClose, StreamingBodyContent
 from .transport import Transport
+from .uri import URITemplate
 
 try:
     __version__ = version("sunday-python")
@@ -52,11 +57,16 @@ __all__ = [
     "EventStreamOptions",
     "FormUrlEncodedCodec",
     "JsonCodec",
+    "LoggingTransportObserver",
     "MediaType",
     "MediaTypeDecoder",
     "MediaTypeDecoders",
     "MediaTypeEncoder",
     "MediaTypeEncoders",
+    "MergePatch",
+    "MultipartBody",
+    "MultipartContent",
+    "MultipartPart",
     "NullableOperation",
     "NullifySpec",
     "Operation",
@@ -65,15 +75,21 @@ __all__ = [
     "ParameterLocation",
     "ParameterSpec",
     "ParameterStyle",
+    "PatchDocument",
+    "PatchOperation",
+    "PatchOperationKind",
     "Problem",
     "ProblemPayload",
     "ProblemRegistry",
+    "RequestPayloadSpec",
     "RequestSpec",
+    "ResponseHeaderSpec",
     "ResponseHeaders",
     "ResponseSpec",
     "ServerSentEvent",
     "StreamingBody",
     "StreamingBodyChunk",
+    "StreamingBodyClose",
     "StreamingBodyContent",
     "StreamingOperation",
     "SundayError",
@@ -81,7 +97,12 @@ __all__ = [
     "TextCodec",
     "TolerantStrEnum",
     "Transport",
+    "TransportEvent",
+    "TransportEventKind",
+    "TransportObserver",
+    "URITemplate",
     "UnexpectedResponse",
+    "WireMode",
     "__version__",
     "encode_parameters",
     "parameter_value",

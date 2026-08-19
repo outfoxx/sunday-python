@@ -46,15 +46,18 @@ class Operation[ResponseT]:
     async def response(self) -> OperationResponse[ResponseT]:
         """Send the request and include native response metadata."""
         response = await self.transport_response()
-        body = await response.aread()
-        if not 200 <= response.status_code < 300:
-            self.transport.raise_problem(response, body)
-        return OperationResponse(
-            self.decode(response),
-            response,
-            response.status_code,
-            ResponseHeaders.from_items(response.headers.multi_items()),
-        )
+        try:
+            body = await response.aread()
+            if not 200 <= response.status_code < 300:
+                self.transport.raise_problem(response, body)
+            return OperationResponse(
+                self.decode(response),
+                response,
+                response.status_code,
+                ResponseHeaders.from_items(response.headers.multi_items()),
+            )
+        finally:
+            await response.aclose()
 
     def transport_request(self) -> httpx.Request:
         """Return the prepared native request."""
@@ -80,15 +83,18 @@ class StreamingOperation[ResponseT]:
     async def response(self) -> OperationResponse[ResponseT]:
         """Send a fresh request and include native response metadata."""
         response = await self.transport_response()
-        body = await response.aread()
-        if not 200 <= response.status_code < 300:
-            self.transport.raise_problem(response, body)
-        return OperationResponse(
-            self.decode(response),
-            response,
-            response.status_code,
-            ResponseHeaders.from_items(response.headers.multi_items()),
-        )
+        try:
+            body = await response.aread()
+            if not 200 <= response.status_code < 300:
+                self.transport.raise_problem(response, body)
+            return OperationResponse(
+                self.decode(response),
+                response,
+                response.status_code,
+                ResponseHeaders.from_items(response.headers.multi_items()),
+            )
+        finally:
+            await response.aclose()
 
     def transport_request(self) -> httpx.Request:
         """Return a fresh native request."""
@@ -136,7 +142,7 @@ def as_transport(transport: Transport) -> HttpxTransport:
 def json_body(body: object | None) -> object | None:
     """Convert a generated model into an HTTPX JSON request value."""
     if isinstance(body, BaseModel):
-        return body.model_dump(mode="json", by_alias=True, exclude_none=True)
+        return body.model_dump(mode="json", by_alias=True, exclude_unset=True)
     return body
 
 

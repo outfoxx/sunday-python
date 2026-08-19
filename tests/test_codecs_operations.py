@@ -19,11 +19,17 @@ from sunday import (
     MediaType,
     MediaTypeDecoders,
     MediaTypeEncoders,
+    MergePatch,
+    MultipartBody,
+    MultipartPart,
     NullableOperation,
     NullifySpec,
     Operation,
     OperationResponse,
     OperationSpec,
+    PatchDocument,
+    PatchOperation,
+    PatchOperationKind,
     Problem,
     ProblemPayload,
     RequestSpec,
@@ -33,6 +39,7 @@ from sunday import (
     StreamingOperation,
     SundayModel,
     TextCodec,
+    WireMode,
 )
 from sunday.cbor import CborCodec
 
@@ -113,6 +120,69 @@ def test_codecs_reject_incompatible_values() -> None:
         FormUrlEncodedCodec().encode("not a mapping")
 
 
+def test_patch_and_multipart_bodies_preserve_wire_semantics() -> None:
+    class Update(SundayModel):
+        name: str | None = None
+        description: str | None = None
+
+    update = Update(name=None)
+    assert JsonCodec(wire_mode=WireMode.PATCH).encode(MergePatch(update)) == b'{"name":null}'
+
+    patch = PatchDocument(
+        (
+            PatchOperation(PatchOperationKind.REMOVE, "/old"),
+            PatchOperation(PatchOperationKind.ADD, "/name", "new"),
+        )
+    )
+    assert JsonCodec().encode(patch) == b'[{"op":"remove","path":"/old"},{"op":"add","path":"/name","value":"new"}]'
+
+    body = MultipartBody(
+        (
+            MultipartPart("metadata", "value"),
+            MultipartPart(
+                "file", StreamingBody.bytes(b"data"), filename="value.txt", content_type=MediaType("text/plain")
+            ),
+        ),
+        boundary="test-boundary",
+    )
+
+    async def collect() -> bytes:
+        return b"".join([chunk async for chunk in body.content()])
+
+    import asyncio
+
+    encoded = asyncio.run(collect())
+    assert b'name="metadata"\r\n\r\nvalue' in encoded
+    assert b'filename="value.txt"\r\nContent-Type: text/plain\r\n\r\ndata' in encoded
+    assert encoded.endswith(b"--test-boundary--\r\n")
+
+
+def test_patch_and_multipart_validation() -> None:
+    with pytest.raises(ValueError, match="paths"):
+        PatchOperation(PatchOperationKind.REMOVE, "invalid")
+    with pytest.raises(ValueError, match="from_path"):
+        PatchOperation(PatchOperationKind.MOVE, "/target")
+    with pytest.raises(ValueError, match="value"):
+        PatchOperation(PatchOperationKind.TEST, "/target")
+    assert (
+        JsonCodec().encode(PatchDocument((PatchOperation(PatchOperationKind.COPY, "/target", from_path="/source"),)))
+        == b'[{"op":"copy","path":"/target","from":"/source"}]'
+    )
+
+    with pytest.raises(ValueError, match="boundaries"):
+        MultipartBody((), boundary='bad"boundary')
+
+    body = MultipartBody((MultipartPart("value", b"bytes", headers=(("X-Test", "bad\nvalue"),)),), boundary="valid")
+
+    async def collect() -> bytes:
+        return b"".join([chunk async for chunk in body.content()])
+
+    import asyncio
+
+    with pytest.raises(ValueError, match="headers"):
+        asyncio.run(collect())
+
+
 @pytest.mark.anyio
 async def test_operation_builds_fresh_requests_and_returns_metadata() -> None:
     transport = FakeTransport()
@@ -154,6 +224,24 @@ async def test_streaming_body_creates_fresh_sync_and_async_content() -> None:
     await operation.execute()
     await operation.execute()
     assert transport.requests == 2
+
+
+@pytest.mark.anyio
+async def test_streaming_body_lifecycle_closes_once() -> None:
+    closes = 0
+
+    async def close() -> None:
+        nonlocal closes
+        closes += 1
+
+    body = StreamingBody(lambda: b"value", close)
+    async with body:
+        assert body.content() == b"value"
+    await body.aclose()
+
+    assert closes == 1
+    with pytest.raises(RuntimeError):
+        body.content()
 
 
 @pytest.mark.anyio

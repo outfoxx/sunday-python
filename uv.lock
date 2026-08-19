@@ -1316,6 +1316,7 @@ name = "sunday-python"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
+    { name = "uritemplate" },
 ]
 
 [package.optional-dependencies]
@@ -1324,6 +1325,8 @@ all = [
     { name = "cbor2" },
     { name = "httpx" },
     { name = "litestar" },
+    { name = "pyyaml" },
+    { name = "xmltodict" },
 ]
 cbor = [
     { name = "cbor2" },
@@ -1335,6 +1338,12 @@ httpx = [
 litestar = [
     { name = "litestar" },
 ]
+xml = [
+    { name = "xmltodict" },
+]
+yaml = [
+    { name = "pyyaml" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1344,6 +1353,8 @@ dev = [
     { name = "ruff" },
     { name = "sunday-python", extra = ["all"] },
     { name = "twine" },
+    { name = "types-pyyaml" },
+    { name = "types-xmltodict" },
 ]
 
 [package.metadata]
@@ -1357,8 +1368,13 @@ requires-dist = [
     { name = "litestar", marker = "extra == 'all'", specifier = ">=2.18,<3" },
     { name = "litestar", marker = "extra == 'litestar'", specifier = ">=2.18,<3" },
     { name = "pydantic", specifier = ">=2.12,<3" },
+    { name = "pyyaml", marker = "extra == 'all'", specifier = ">=6.0.3,<7" },
+    { name = "pyyaml", marker = "extra == 'yaml'", specifier = ">=6.0.3,<7" },
+    { name = "uritemplate", specifier = ">=4.2,<5" },
+    { name = "xmltodict", marker = "extra == 'all'", specifier = ">=1.0.4,<2" },
+    { name = "xmltodict", marker = "extra == 'xml'", specifier = ">=1.0.4,<2" },
 ]
-provides-extras = ["all", "cbor", "httpx", "litestar"]
+provides-extras = ["all", "cbor", "httpx", "litestar", "xml", "yaml"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1368,6 +1384,8 @@ dev = [
     { name = "ruff", specifier = ">=0.14,<1" },
     { name = "sunday-python", extras = ["all"], editable = "." },
     { name = "twine", specifier = ">=6,<7" },
+    { name = "types-pyyaml", specifier = ">=6,<7" },
+    { name = "types-xmltodict", specifier = ">=0.15,<1" },
 ]
 
 [[package]]
@@ -1388,6 +1406,24 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e0/a8/949edebe3a82774c1ec34f637f5dd82d1cf22c25e963b7d63771083bbee5/twine-6.2.0.tar.gz", hash = "sha256:e5ed0d2fd70c9959770dce51c8f39c8945c574e18173a7b81802dab51b4b75cf", size = 172262, upload-time = "2025-09-04T15:43:17.255Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3a/7a/882d99539b19b1490cac5d77c67338d126e4122c8276bf640e411650c830/twine-6.2.0-py3-none-any.whl", hash = "sha256:418ebf08ccda9a8caaebe414433b0ba5e25eb5e4a927667122fbe8f829f985d8", size = 42727, upload-time = "2025-09-04T15:43:15.994Z" },
+]
+
+[[package]]
+name = "types-pyyaml"
+version = "6.0.12.20260815"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9f/72/b56089aeee6c496d969bac42376bedb6e3eeab4682e1018fa3137122f94b/types_pyyaml-6.0.12.20260815.tar.gz", hash = "sha256:28764110c9cf35846e733da32d8d734df7473c5dde9ef67c3b7332ec0e819858", size = 18545, upload-time = "2026-08-15T02:41:51.532Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/52/eefeba09be4ef2a1eb989eb92934561e8e502a6ee3c32654996e4be7e399/types_pyyaml-6.0.12.20260815-py3-none-any.whl", hash = "sha256:6f332212b7e191f3afd5016a713c510b6340593b7ebec573c7d5d20aa5386d3b", size = 21148, upload-time = "2026-08-15T02:41:50.555Z" },
+]
+
+[[package]]
+name = "types-xmltodict"
+version = "0.15.0.20250907"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a9/a2/810727dc7b6e4c4302ff803e8f2e55302da897aeb4f1f77a9139ccda1430/types_xmltodict-0.15.0.20250907.tar.gz", hash = "sha256:6d800239bd120cabcd6d6880550c54fdeb39759e128c81c0ff5507546c127c2a", size = 7893, upload-time = "2025-09-07T02:56:23.995Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7a/ed/d76dda83bd26e509a1e8f93677898983fb51970b4df053794d6a14d7d136/types_xmltodict-0.15.0.20250907-py3-none-any.whl", hash = "sha256:9a9407b0c46fd2c3b7cb37c39a07333fc22f722bf24292ada9ff393f244e6fc7", size = 7599, upload-time = "2025-09-07T02:56:23.02Z" },
 ]
 
 [[package]]
@@ -1421,10 +1457,28 @@ wheels = [
 ]
 
 [[package]]
+name = "uritemplate"
+version = "4.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/98/60/f174043244c5306c9988380d2cb10009f91563fc4b31293d27e17201af56/uritemplate-4.2.0.tar.gz", hash = "sha256:480c2ed180878955863323eea31b0ede668795de182617fef9c6ca09e6ec9d0e", size = 33267, upload-time = "2025-06-02T15:12:06.318Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a9/99/3ae339466c9183ea5b8ae87b34c0b897eda475d2aec2307cae60e5cd4f29/uritemplate-4.2.0-py3-none-any.whl", hash = "sha256:962201ba1c4edcab02e60f9a0d3821e82dfc5d2d6662a21abd533879bdb8a686", size = 11488, upload-time = "2025-06-02T15:12:03.405Z" },
+]
+
+[[package]]
 name = "urllib3"
 version = "2.7.0"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
+]
+
+[[package]]
+name = "xmltodict"
+version = "1.0.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/19/70/80f3b7c10d2630aa66414bf23d210386700aa390547278c789afa994fd7e/xmltodict-1.0.4.tar.gz", hash = "sha256:6d94c9f834dd9e44514162799d344d815a3a4faec913717a9ecbfa5be1bb8e61", size = 26124, upload-time = "2026-02-22T02:21:22.074Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/34/98a2f52245f4d47be93b580dae5f9861ef58977d73a79eb47c58f1ad1f3a/xmltodict-1.0.4-py3-none-any.whl", hash = "sha256:a4a00d300b0e1c59fc2bfccb53d7b2e88c32f200df138a0dd2229f842497026a", size = 13580, upload-time = "2026-02-22T02:21:21.039Z" },
 ]

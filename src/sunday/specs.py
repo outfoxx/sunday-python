@@ -13,6 +13,14 @@ from .parameters import ParameterSpec
 
 
 @dataclass(frozen=True, slots=True)
+class RequestPayloadSpec[RequestBodyT]:
+    """A request body and the media types available to encode it."""
+
+    body: RequestBodyT
+    content_types: tuple[MediaType, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RequestSpec[RequestBodyT]:
     """Declarative HTTP request description consumed by a transport."""
 
@@ -23,10 +31,35 @@ class RequestSpec[RequestBodyT]:
     body: RequestBodyT | None = None
     content_types: tuple[MediaType, ...] = ()
     accept_types: tuple[MediaType, ...] = ()
+    payload: RequestPayloadSpec[RequestBodyT] | None = None
+
+    def __post_init__(self) -> None:
+        if self.payload is not None and (self.body is not None or self.content_types):
+            raise ValueError("RequestSpec payload cannot be combined with body or content_types")
 
     def with_headers(self, *headers: tuple[str, str]) -> RequestSpec[RequestBodyT]:
         """Return a request specification with appended headers."""
         return replace(self, headers=(*self.headers, *headers))
+
+    @property
+    def effective_body(self) -> RequestBodyT | None:
+        """Return the request body from the payload form or compatibility fields."""
+        return self.payload.body if self.payload is not None else self.body
+
+    @property
+    def effective_content_types(self) -> tuple[MediaType, ...]:
+        """Return the payload media types from either request representation."""
+        return self.payload.content_types if self.payload is not None else self.content_types
+
+
+@dataclass(frozen=True, slots=True)
+class ResponseHeaderSpec[HeaderT]:
+    """A declared response header and its generated value decoder."""
+
+    name: str
+    decoder: Callable[[str], HeaderT] | None = None
+    required: bool = False
+    repeated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +70,7 @@ class ResponseSpec[ResponseT]:
     content_types: tuple[MediaType, ...] = ()
     decoder: Callable[[object], ResponseT] | None = None
     body_expected: bool = True
+    headers: tuple[ResponseHeaderSpec[object], ...] = ()
 
     def accepts(self, media_type: MediaType | None) -> bool:
         """Return whether this response specification accepts ``media_type``."""

@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
   "pydantic>=2.12,<3",
+  "uritemplate>=4.2,<5",
 ]
 
 [project.optional-dependencies]
@@ -36,11 +37,19 @@ litestar = [
 cbor = [
   "cbor2>=6,<7",
 ]
+xml = [
+  "xmltodict>=1.0.4,<2",
+]
+yaml = [
+  "PyYAML>=6.0.3,<7",
+]
 all = [
   "anyio>=4,<5",
   "cbor2>=6,<7",
   "httpx>=0.28,<1",
   "litestar>=2.18,<3",
+  "PyYAML>=6.0.3,<7",
+  "xmltodict>=1.0.4,<2",
 ]
 
 [project.urls]
@@ -55,6 +64,8 @@ dev = [
   "pytest-cov>=7,<8",
   "ruff>=0.14,<1",
   "twine>=6,<7",
+  "types-PyYAML>=6,<7",
+  "types-xmltodict>=0.15,<1",
   "sunday-python[all]",
 ]
 

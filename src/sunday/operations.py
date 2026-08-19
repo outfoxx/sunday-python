@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from .headers import ResponseHeaders
@@ -22,6 +23,7 @@ class OperationResponse[ResponseT]:
     transport_response: Any
     status: int
     headers: ResponseHeaders
+    decoded_headers: Mapping[str, object] = field(default_factory=dict)
 
     def get_headers(self, name: str) -> tuple[str, ...]:
         """Return every response header matching ``name``."""
@@ -30,6 +32,11 @@ class OperationResponse[ResponseT]:
     def get_header(self, name: str) -> str | None:
         """Return the first response header matching ``name``."""
         return self.headers.get(name)
+
+    def decoded_header(self, name: str) -> object | None:
+        """Return a decoded declared header value case-insensitively."""
+        lower_name = name.lower()
+        return next((value for key, value in self.decoded_headers.items() if key.lower() == lower_name), None)
 
     @property
     def content_type(self) -> MediaType | None:
