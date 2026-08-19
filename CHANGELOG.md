@@ -6,3 +6,5 @@
 - Add URI templates, multipart and patch bodies, typed response headers, XML/YAML codecs, transport lifecycle and
   observation, and closure-based HTTPX request adapters.
 - Remove runtime-owned token authorization helpers; authentication and operational policy remain consumer adapters.
+- Add generic transport, event-stream, and problem-registration protocols so generated clients remain transport-neutral.
+- Retain the HTTPX compatibility module only for packages produced by earlier beta generators.

@@ -81,6 +81,10 @@ class ProblemRegistry:
             raise TypeError("Registered problem types must extend Problem")
         self._problem_types[type_uri] = problem_type
 
+    def register_problem(self, type_uri: str, problem_type: type[Problem]) -> None:
+        """Register a problem through the transport-neutral registrar contract."""
+        self.register(type_uri, problem_type)
+
     def decode(self, value: Mapping[str, object], *, response_status: int | None = None) -> Problem:
         """Decode a problem mapping, falling back to the base problem type."""
         type_uri = value.get("type", "about:blank")

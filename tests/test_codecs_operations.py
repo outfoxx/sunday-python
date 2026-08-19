@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, Iterable, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Sequence
 from datetime import date
 from enum import StrEnum
+from types import TracebackType
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from pydantic import Field
 
 from sunday import (
     BinaryCodec,
+    EventStreamOptions,
     FormUrlEncodedCodec,
     JsonCodec,
     MediaType,
@@ -36,6 +38,7 @@ from sunday import (
     RequestSpec,
     ResponseHeaders,
     ResponseSpec,
+    ServerSentEvent,
     StreamingBody,
     StreamingOperation,
     SundayModel,
@@ -57,24 +60,56 @@ class State(StrEnum):
     ACTIVE = "active"
 
 
+class EmptyEventStream[EventT]:
+    def __aiter__(self) -> AsyncIterator[EventT]:
+        return self.events()
+
+    async def events(self) -> AsyncIterator[EventT]:
+        if False:
+            yield  # pragma: no cover
+
+    async def aclose(self) -> None:
+        pass
+
+    async def __aenter__(self) -> EmptyEventStream[EventT]:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+
+
 class FakeTransport:
     def __init__(self, result: object = "result", problem: Problem | None = None) -> None:
         self.result = result
         self.problem = problem
         self.requests = 0
+        self.registered_problems: dict[str, type[Problem]] = {}
+
+    def register_problem(self, type_uri: str, problem_type: type[Problem]) -> None:
+        self.registered_problems[type_uri] = problem_type
 
     def build_request(self, spec: RequestSpec[Any]) -> tuple[int, RequestSpec[Any]]:
         self.requests += 1
         return self.requests, spec
 
-    async def send(self, request: object, *, stream: bool = False) -> object:
+    async def send(
+        self,
+        request: tuple[int, RequestSpec[Any]],
+        *,
+        stream: bool = False,
+    ) -> tuple[tuple[int, RequestSpec[Any]], bool]:
         return request, stream
 
     async def decode_response(
         self,
-        response: object,
+        response: tuple[tuple[int, RequestSpec[Any]], bool],
         responses: Sequence[ResponseSpec[Any]],
-    ) -> OperationResponse[Any]:
+    ) -> OperationResponse[Any, tuple[tuple[int, RequestSpec[Any]], bool]]:
         del responses
         if self.problem is not None:
             raise self.problem
@@ -84,6 +119,30 @@ class FakeTransport:
             200,
             ResponseHeaders.from_items([("Content-Type", "application/json")]),
         )
+
+    def event_stream[EventT](
+        self,
+        spec: RequestSpec[None],
+        decoder: Callable[[ServerSentEvent], EventT],
+        *,
+        options: EventStreamOptions | None = None,
+    ) -> EmptyEventStream[EventT]:
+        del spec, decoder, options
+        return EmptyEventStream()
+
+    async def aclose(self) -> None:
+        pass
+
+    async def __aenter__(self) -> FakeTransport:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
 
 
 def test_builtin_codecs_and_registries() -> None:
@@ -196,7 +255,11 @@ def test_patch_and_multipart_validation() -> None:
 async def test_operation_builds_fresh_requests_and_returns_metadata() -> None:
     transport = FakeTransport()
     spec: OperationSpec[None, str] = OperationSpec(RequestSpec("GET", "/projects"), (ResponseSpec(200),))
-    operation = Operation[str](transport, spec)
+    operation = Operation[
+        str,
+        tuple[int, RequestSpec[Any]],
+        tuple[tuple[int, RequestSpec[Any]], bool],
+    ](transport, spec)
 
     assert await operation.execute() == "result"
     assert (await operation.response()).content_type == MediaType("application/json")
@@ -226,7 +289,11 @@ async def test_streaming_body_creates_fresh_sync_and_async_content() -> None:
     assert StreamingBody.bytes(b"value").content() == b"value"
 
     transport = FakeTransport()
-    operation = StreamingOperation[str](
+    operation = StreamingOperation[
+        str,
+        tuple[int, RequestSpec[Any]],
+        tuple[tuple[int, RequestSpec[Any]], bool],
+    ](
         transport,
         OperationSpec(RequestSpec("POST", "/upload", body=sync_body), (ResponseSpec(200),)),
     )
@@ -256,7 +323,11 @@ async def test_streaming_body_lifecycle_closes_once() -> None:
 @pytest.mark.anyio
 async def test_nullable_operation_matches_status_and_problem_type() -> None:
     status_problem = Problem(ProblemPayload(status=404, title="Missing"))
-    status_operation = NullableOperation[str](
+    status_operation = NullableOperation[
+        str,
+        tuple[int, RequestSpec[Any]],
+        tuple[tuple[int, RequestSpec[Any]], bool],
+    ](
         FakeTransport(problem=status_problem),
         OperationSpec(RequestSpec("GET", "/missing"), (ResponseSpec(200),)),
         NullifySpec(statuses=(404,)),
@@ -265,14 +336,22 @@ async def test_nullable_operation_matches_status_and_problem_type() -> None:
     assert await status_operation.response_or_none() is None
 
     typed_problem = MissingProblem(ProblemPayload(status=409))
-    typed_operation = NullableOperation[str](
+    typed_operation = NullableOperation[
+        str,
+        tuple[int, RequestSpec[Any]],
+        tuple[tuple[int, RequestSpec[Any]], bool],
+    ](
         FakeTransport(problem=typed_problem),
         OperationSpec(RequestSpec("GET", "/missing"), (ResponseSpec(200),)),
         NullifySpec(problem_types=(MissingProblem,)),
     )
     assert await typed_operation.execute_or_none() is None
 
-    unmatched = NullableOperation[str](
+    unmatched = NullableOperation[
+        str,
+        tuple[int, RequestSpec[Any]],
+        tuple[tuple[int, RequestSpec[Any]], bool],
+    ](
         FakeTransport(problem=status_problem),
         OperationSpec(RequestSpec("GET", "/missing"), (ResponseSpec(200),)),
         NullifySpec(statuses=(409,)),

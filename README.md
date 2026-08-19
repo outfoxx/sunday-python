@@ -8,15 +8,28 @@ The package is currently under local development. No public release has been pub
 
 ## Installation
 
-Install only the adapters required by the generated project:
+Generated clients require only the transport-neutral core. Install an adapter separately when the application chooses one:
 
 ```shell
+pip install sunday-python
 pip install "sunday-python[httpx]"
 pip install "sunday-python[litestar]"
 pip install "sunday-python[httpx,litestar,cbor,xml,yaml]"
 ```
 
 The distribution is named `sunday-python`; public APIs are imported from `sunday`.
+
+Generated clients accept a `sunday.Transport` implementation. Applications using HTTPX construct the adapter explicitly:
+
+```python
+import httpx
+from sunday.httpx import HttpxTransport
+
+from example_api.projects import ProjectsClient
+
+http_client = httpx.AsyncClient(base_url="https://api.example.test")
+client = ProjectsClient(HttpxTransport(http_client))
+```
 
 ## Development
 

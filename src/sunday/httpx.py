@@ -25,6 +25,7 @@ from .problems import Problem, ProblemRegistry
 from .specs import RequestSpec, ResponseSpec
 from .sse import EventStreamOptions, ServerSentEvent
 from .streaming import StreamingBody
+from .transport import Transport
 
 ResponseT = TypeVar("ResponseT")
 
@@ -43,7 +44,7 @@ type HttpxRequestAdapterCallable = Callable[
 ]
 
 
-class HttpxTransport:
+class HttpxTransport(Transport[httpx.Request, httpx.Response]):
     """Sunday transport implemented by an ``httpx.AsyncClient``."""
 
     def __init__(
@@ -172,7 +173,7 @@ class HttpxTransport:
         self,
         response: httpx.Response,
         responses: Sequence[ResponseSpec[Any]],
-    ) -> OperationResponse[Any]:
+    ) -> OperationResponse[Any, httpx.Response]:
         """Decode a successful response or raise its typed problem."""
         body = await response.aread()
         try:
@@ -186,7 +187,7 @@ class HttpxTransport:
         response: httpx.Response,
         body: bytes,
         responses: Sequence[ResponseSpec[Any]],
-    ) -> OperationResponse[Any]:
+    ) -> OperationResponse[Any, httpx.Response]:
         if not 200 <= response.status_code < 300:
             self.raise_problem(response, body)
 

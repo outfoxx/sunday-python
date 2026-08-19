@@ -3,10 +3,11 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Compatibility surface for Sunday Generator's Python 2.0 beta output.
+"""Compatibility surface for Python clients generated before the neutral transport target.
 
-Generated packages retain a small ``runtime.py`` re-export module during the beta
-line. New handwritten code should prefer the declarative APIs in :mod:`sunday`.
+Current generated clients import transport-neutral APIs directly from :mod:`sunday`.
+This module remains available for existing beta packages that still contain a
+generated ``runtime.py`` shim.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ class Operation[ResponseT]:
         """Send the request and return the decoded body."""
         return (await self.response()).result
 
-    async def response(self) -> OperationResponse[ResponseT]:
+    async def response(self) -> OperationResponse[ResponseT, httpx.Response]:
         """Send the request and include native response metadata."""
         response = await self.transport_response()
         try:
@@ -80,7 +81,7 @@ class StreamingOperation[ResponseT]:
         """Send a fresh request and return the decoded body."""
         return (await self.response()).result
 
-    async def response(self) -> OperationResponse[ResponseT]:
+    async def response(self) -> OperationResponse[ResponseT, httpx.Response]:
         """Send a fresh request and include native response metadata."""
         response = await self.transport_response()
         try:

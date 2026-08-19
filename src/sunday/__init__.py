@@ -43,7 +43,7 @@ from .problems import Problem, ProblemPayload, ProblemRegistry
 from .specs import NullifySpec, OperationSpec, RequestPayloadSpec, RequestSpec, ResponseHeaderSpec, ResponseSpec
 from .sse import EventParser, EventStreamOptions, ServerSentEvent
 from .streaming import StreamingBody, StreamingBodyChunk, StreamingBodyClose, StreamingBodyContent
-from .transport import Transport
+from .transport import EventStream, ProblemRegistrar, Transport
 from .uri import URITemplate
 
 try:
@@ -55,6 +55,7 @@ __all__ = [
     "BinaryCodec",
     "EncodedParameters",
     "EventParser",
+    "EventStream",
     "EventStreamOptions",
     "FormUrlEncodedCodec",
     "JsonCodec",
@@ -81,6 +82,7 @@ __all__ = [
     "PatchOperationKind",
     "Problem",
     "ProblemPayload",
+    "ProblemRegistrar",
     "ProblemRegistry",
     "RequestPayloadSpec",
     "RequestSpec",

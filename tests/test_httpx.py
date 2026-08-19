@@ -106,7 +106,7 @@ async def test_streaming_request_body_is_recreated_per_operation_attempt() -> No
         transport=httpx.MockTransport(handler),
     ) as client:
         transport = HttpxTransport(client)
-        operation = Operation[None](
+        operation = Operation[None, httpx.Request, httpx.Response](
             transport,
             OperationSpec(
                 RequestSpec(
@@ -134,7 +134,7 @@ async def test_response_decoding_selects_status_media_and_decoder() -> None:
         transport=httpx.MockTransport(handler),
     ) as client:
         transport = HttpxTransport(client)
-        operation = Operation[dict[str, str]](
+        operation = Operation[dict[str, str], httpx.Request, httpx.Response](
             transport,
             OperationSpec(
                 RequestSpec("GET", "/projects/one"),
@@ -183,7 +183,7 @@ async def test_typed_problem_decoding_and_generic_fallback() -> None:
     ) as client:
         transport = HttpxTransport(client)
         transport.register_problem("https://example.test/problems/conflict", ConflictProblem)
-        operation = Operation[None](
+        operation = Operation[None, httpx.Request, httpx.Response](
             transport,
             OperationSpec(RequestSpec("GET", "/projects/one"), (ResponseSpec(204, body_expected=False),)),
         )
@@ -213,7 +213,7 @@ async def test_unexpected_responses_preserve_diagnostics() -> None:
         base_url="https://api.example.test",
         transport=httpx.MockTransport(handler),
     ) as client:
-        operation = Operation[str](
+        operation = Operation[str, httpx.Request, httpx.Response](
             HttpxTransport(client),
             OperationSpec(
                 RequestSpec("GET", "/value"),
@@ -246,7 +246,7 @@ async def test_response_decodes_declared_headers() -> None:
         base_url="https://api.example.test",
         transport=httpx.MockTransport(handler),
     ) as client:
-        operation = Operation[dict[str, bool]](
+        operation = Operation[dict[str, bool], httpx.Request, httpx.Response](
             HttpxTransport(client),
             OperationSpec(
                 RequestSpec("GET", "/value"),

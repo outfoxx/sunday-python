@@ -7,20 +7,23 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from .headers import ResponseHeaders
 from .media import MediaType
 from .problems import Problem
 from .specs import NullifySpec, OperationSpec
 
+if TYPE_CHECKING:
+    from .transport import Transport
+
 
 @dataclass(frozen=True, slots=True)
-class OperationResponse[ResponseT]:
+class OperationResponse[ResponseT, TransportResponseT]:
     """A decoded operation result with transport response metadata."""
 
     result: ResponseT
-    transport_response: Any
+    transport_response: TransportResponseT
     status: int
     headers: ResponseHeaders
     decoded_headers: Mapping[str, object] = field(default_factory=dict)
@@ -45,51 +48,53 @@ class OperationResponse[ResponseT]:
 
 
 @dataclass(frozen=True, slots=True)
-class Operation[ResponseT]:
+class Operation[ResponseT, TransportRequestT, TransportResponseT]:
     """A reusable generated HTTP operation."""
 
-    transport: Any
+    transport: Transport[TransportRequestT, TransportResponseT]
     spec: OperationSpec[Any, ResponseT]
 
     async def execute(self) -> ResponseT:
         """Execute the operation and return its decoded result."""
         return (await self.response()).result
 
-    async def response(self) -> OperationResponse[ResponseT]:
+    async def response(self) -> OperationResponse[ResponseT, TransportResponseT]:
         """Execute the operation and include response metadata."""
         response = await self.transport_response()
         decoded = await self.transport.decode_response(response, self.spec.responses)
-        return cast(OperationResponse[ResponseT], decoded)
+        return cast(OperationResponse[ResponseT, TransportResponseT], decoded)
 
-    def transport_request(self) -> Any:
+    def transport_request(self) -> TransportRequestT:
         """Build and return a fresh native transport request."""
         return self.transport.build_request(self.spec.request)
 
-    async def transport_response(self) -> Any:
+    async def transport_response(self) -> TransportResponseT:
         """Send a fresh native request and return its native response."""
         return await self.transport.send(self.transport_request())
 
 
-class StreamingOperation[ResponseT](Operation[ResponseT]):
+class StreamingOperation[ResponseT, TransportRequestT, TransportResponseT](
+    Operation[ResponseT, TransportRequestT, TransportResponseT]
+):
     """An operation whose reusable body creates fresh content per execution."""
 
 
 @dataclass(frozen=True, slots=True)
-class NullableOperation[ResponseT]:
+class NullableOperation[ResponseT, TransportRequestT, TransportResponseT]:
     """An operation that can translate selected problems into ``None``."""
 
-    transport: Any
+    transport: Transport[TransportRequestT, TransportResponseT]
     spec: OperationSpec[Any, ResponseT]
     nullify: NullifySpec
 
-    def _operation(self) -> Operation[ResponseT]:
+    def _operation(self) -> Operation[ResponseT, TransportRequestT, TransportResponseT]:
         return Operation(self.transport, self.spec)
 
     async def execute(self) -> ResponseT:
         """Execute without nullifying problems."""
         return await self._operation().execute()
 
-    async def response(self) -> OperationResponse[ResponseT]:
+    async def response(self) -> OperationResponse[ResponseT, TransportResponseT]:
         """Execute without nullifying problems and include metadata."""
         return await self._operation().response()
 
@@ -98,7 +103,7 @@ class NullableOperation[ResponseT]:
         response = await self.response_or_none()
         return response.result if response is not None else None
 
-    async def response_or_none(self) -> OperationResponse[ResponseT] | None:
+    async def response_or_none(self) -> OperationResponse[ResponseT, TransportResponseT] | None:
         """Return ``None`` when a configured problem is raised."""
         try:
             return await self.response()
@@ -107,11 +112,11 @@ class NullableOperation[ResponseT]:
                 return None
             raise
 
-    def transport_request(self) -> Any:
+    def transport_request(self) -> TransportRequestT:
         """Build and return a fresh native transport request."""
         return self._operation().transport_request()
 
-    async def transport_response(self) -> Any:
+    async def transport_response(self) -> TransportResponseT:
         """Send a fresh native request and return its native response."""
         return await self._operation().transport_response()
 
