@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+import base64
+from collections.abc import Mapping, Sequence, Set
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time
 from enum import Enum, StrEnum
 from typing import TypeGuard
@@ -98,6 +99,8 @@ def encode_parameters(parameters: Sequence[ParameterSpec]) -> EncodedParameters:
     for parameter in parameters:
         if parameter.value is None:
             continue
+        if isinstance(parameter.value, BaseModel):
+            parameter = replace(parameter, value=parameter_object(parameter.value))
         if parameter.location == ParameterLocation.PATH:
             path.append((parameter.name, _encode_path(parameter)))
         elif parameter.location == ParameterLocation.QUERY:
@@ -119,7 +122,7 @@ def parameter_value(value: object) -> str:
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
     if isinstance(value, bytes):
-        return value.decode("utf-8")
+        return base64.b64encode(value).decode("ascii")
     return str(value)
 
 
@@ -252,5 +255,5 @@ def _quote(value: object, allow_reserved: bool) -> str:
     return quote(parameter_value(value), safe=safe)
 
 
-def _is_sequence(value: object) -> TypeGuard[Sequence[object]]:
-    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview))
+def _is_sequence(value: object) -> TypeGuard[Sequence[object] | Set[object]]:
+    return isinstance(value, (Sequence, Set)) and not isinstance(value, (str, bytes, bytearray, memoryview))

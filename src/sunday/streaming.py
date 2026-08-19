@@ -10,6 +10,8 @@ from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from types import TracebackType
 
+from .errors import TransportError
+
 type StreamingBodyChunk = bytes | bytearray | memoryview
 type StreamingBodyContent = bytes | Iterable[bytes] | AsyncIterable[bytes]
 type StreamingBodyClose = Callable[[], Awaitable[None] | None]
@@ -51,7 +53,7 @@ class StreamingBody:
     def content(self) -> StreamingBodyContent:
         """Create content for one request attempt."""
         if self._closed:
-            raise RuntimeError("StreamingBody is closed")
+            raise TransportError("StreamingBody is closed")
         return self.factory()
 
     async def aclose(self) -> None:
@@ -67,7 +69,7 @@ class StreamingBody:
     async def __aenter__(self) -> StreamingBody:
         """Enter an asynchronous body lifecycle scope."""
         if self._closed:
-            raise RuntimeError("StreamingBody is closed")
+            raise TransportError("StreamingBody is closed")
         return self
 
     async def __aexit__(

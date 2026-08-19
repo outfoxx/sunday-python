@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from enum import Enum, StrEnum
@@ -53,6 +54,10 @@ class MediaTypeDecoder(Protocol):
         ...
 
 
+class _MediaTypeCodec(MediaTypeEncoder, MediaTypeDecoder, Protocol):
+    pass
+
+
 class MediaTypeEncoders:
     """Ordered registry of request media type encoders."""
 
@@ -61,8 +66,8 @@ class MediaTypeEncoders:
 
     @classmethod
     def defaults(cls) -> MediaTypeEncoders:
-        """Create a registry with the built-in HTTP encoders."""
-        return cls((JsonCodec(), TextCodec(), BinaryCodec(), FormUrlEncodedCodec()))
+        """Create a registry with built-in and installed optional encoders."""
+        return cls(_default_codecs())
 
     def register(self, encoder: MediaTypeEncoder, *, first: bool = False) -> None:
         """Register an encoder, optionally before existing encoders."""
@@ -91,8 +96,8 @@ class MediaTypeDecoders:
 
     @classmethod
     def defaults(cls) -> MediaTypeDecoders:
-        """Create a registry with the built-in HTTP decoders."""
-        return cls((JsonCodec(), TextCodec(), BinaryCodec(), FormUrlEncodedCodec()))
+        """Create a registry with built-in and installed optional decoders."""
+        return cls(_default_codecs())
 
     def register(self, decoder: MediaTypeDecoder, *, first: bool = False) -> None:
         """Register a decoder, optionally before existing decoders."""
@@ -196,9 +201,49 @@ def _json_value(value: object, wire_mode: WireMode = WireMode.REQUEST) -> object
     if isinstance(value, Enum):
         return _json_value(value.value, wire_mode)
     if isinstance(value, (datetime, date, time, UUID)):
-        return str(value)
+        return value.isoformat() if isinstance(value, (datetime, date, time)) else str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(value)).decode("ascii")
     if isinstance(value, Mapping):
         return {str(key): _json_value(item, wire_mode) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview)):
         return [_json_value(item, wire_mode) for item in value]
+    if isinstance(value, Set):
+        return [_json_value(item, wire_mode) for item in value]
     return value
+
+
+def _default_codecs() -> tuple[_MediaTypeCodec, ...]:
+    codecs: list[_MediaTypeCodec] = [JsonCodec()]
+    codecs.extend(_optional_codecs())
+    codecs.extend((FormUrlEncodedCodec(), TextCodec(), BinaryCodec()))
+    return tuple(codecs)
+
+
+def _optional_codecs() -> tuple[_MediaTypeCodec, ...]:
+    codecs: list[_MediaTypeCodec] = []
+    try:
+        from .cbor import CborCodec
+    except ModuleNotFoundError as error:
+        if error.name != "cbor2":
+            raise
+    else:
+        codecs.append(CborCodec())
+
+    try:
+        from .xml import XmlCodec
+    except ModuleNotFoundError as error:
+        if error.name != "xmltodict":
+            raise
+    else:
+        codecs.append(XmlCodec())
+
+    try:
+        from .yaml import YamlCodec
+    except ModuleNotFoundError as error:
+        if error.name != "yaml":
+            raise
+    else:
+        codecs.append(YamlCodec())
+
+    return tuple(codecs)

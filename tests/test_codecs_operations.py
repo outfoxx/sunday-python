@@ -6,16 +6,20 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from types import TracebackType
 from typing import Any
+from uuid import UUID
 
 import pytest
 from pydantic import Field
 
 from sunday import (
+    BaseTransport,
     BinaryCodec,
+    EventSource,
+    EventSourceState,
     EventStreamOptions,
     FormUrlEncodedCodec,
     JsonCodec,
@@ -43,6 +47,7 @@ from sunday import (
     StreamingOperation,
     SundayModel,
     TextCodec,
+    TransportError,
     WireMode,
 )
 from sunday.cbor import CborCodec
@@ -83,38 +88,63 @@ class EmptyEventStream[EventT]:
         del exc_type, exc_value, traceback
 
 
-class FakeTransport:
+class EmptyEventSource:
+    ready_state = EventSourceState.CLOSED
+    retry_time = 0.5
+    on_open: Callable[[], None] | None = None
+    on_error: Callable[[BaseException | None], None] | None = None
+    on_message: Callable[[ServerSentEvent], None] | None = None
+
+    def add_event_listener(self, event: str, handler: Callable[[ServerSentEvent], None]) -> UUID:
+        del event, handler
+        return UUID(int=0)
+
+    def remove_event_listener(self, event: str, listener: UUID) -> None:
+        del event, listener
+
+    def connect(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class FakeTransport(BaseTransport[tuple[int, RequestSpec[Any]], tuple[tuple[int, RequestSpec[Any]], bool]]):
     def __init__(self, result: object = "result", problem: Problem | None = None) -> None:
-        self.result = result
+        self.result_value = result
         self.problem = problem
         self.requests = 0
+        self.calls: list[str] = []
         self.registered_problems: dict[str, type[Problem]] = {}
 
     def register_problem(self, type_uri: str, problem_type: type[Problem]) -> None:
         self.registered_problems[type_uri] = problem_type
 
-    def build_request(self, spec: RequestSpec[Any]) -> tuple[int, RequestSpec[Any]]:
+    async def _prepare_request(self, spec: RequestSpec[Any]) -> tuple[int, RequestSpec[Any]]:
+        self.calls.append("transport_request")
         self.requests += 1
         return self.requests, spec
 
-    async def send(
+    async def _send(
         self,
         request: tuple[int, RequestSpec[Any]],
         *,
         stream: bool = False,
     ) -> tuple[tuple[int, RequestSpec[Any]], bool]:
+        self.calls.append("transport_response")
         return request, stream
 
-    async def decode_response(
+    async def _decode_response(
         self,
         response: tuple[tuple[int, RequestSpec[Any]], bool],
         responses: Sequence[ResponseSpec[Any]],
     ) -> OperationResponse[Any, tuple[tuple[int, RequestSpec[Any]], bool]]:
+        self.calls.append("response")
         del responses
         if self.problem is not None:
             raise self.problem
         return OperationResponse(
-            self.result,
+            self.result_value,
             response,
             200,
             ResponseHeaders.from_items([("Content-Type", "application/json")]),
@@ -123,12 +153,21 @@ class FakeTransport:
     def event_stream[EventT](
         self,
         spec: RequestSpec[None],
-        decoder: Callable[[ServerSentEvent], EventT],
+        decoder: Callable[[ServerSentEvent], EventT | None],
         *,
         options: EventStreamOptions | None = None,
     ) -> EmptyEventStream[EventT]:
         del spec, decoder, options
         return EmptyEventStream()
+
+    def event_source(
+        self,
+        spec: RequestSpec[None],
+        *,
+        options: EventStreamOptions | None = None,
+    ) -> EventSource:
+        del spec, options
+        return EmptyEventSource()
 
     async def aclose(self) -> None:
         pass
@@ -154,6 +193,11 @@ def test_builtin_codecs_and_registries() -> None:
     assert json_codec.encode({"state": State.ACTIVE, "date": date(2026, 8, 18)}) == (
         b'{"state":"active","date":"2026-08-18"}'
     )
+    assert json_codec.encode({"bytes": b"value", "set": {"one", "two"}}) in {
+        b'{"bytes":"dmFsdWU=","set":["one","two"]}',
+        b'{"bytes":"dmFsdWU=","set":["two","one"]}',
+    }
+    assert json_codec.encode(datetime(2026, 8, 18, 12, 30, tzinfo=UTC)) == b'"2026-08-18T12:30:00+00:00"'
     assert json_codec.decode(json_bytes, MediaType("application/problem+json")) == {"created-at": "2026-08-18"}
     assert TextCodec().decode("héllo".encode(), MediaType("text/plain; charset=utf-8")) == "héllo"
     assert BinaryCodec().encode(memoryview(b"abc")) == b"abc"
@@ -262,8 +306,9 @@ async def test_operation_builds_fresh_requests_and_returns_metadata() -> None:
     ](transport, spec)
 
     assert await operation.execute() == "result"
+    assert transport.calls == ["transport_request", "transport_response", "response"]
     assert (await operation.response()).content_type == MediaType("application/json")
-    assert operation.transport_request() == (3, spec.request)
+    assert await operation.transport_request() == (3, spec.request)
     assert await operation.transport_response() == ((4, spec.request), False)
 
 
@@ -316,7 +361,7 @@ async def test_streaming_body_lifecycle_closes_once() -> None:
     await body.aclose()
 
     assert closes == 1
-    with pytest.raises(RuntimeError):
+    with pytest.raises(TransportError):
         body.content()
 
 

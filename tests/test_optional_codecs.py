@@ -5,7 +5,8 @@
 
 import pytest
 
-from sunday import MediaType
+from sunday import MediaType, MediaTypeDecoders, MediaTypeEncoders
+from sunday.cbor import CborCodec
 from sunday.xml import XmlCodec
 from sunday.yaml import YamlCodec
 
@@ -26,3 +27,12 @@ def test_xml_codec_requires_one_root_and_matches_structured_suffixes() -> None:
     assert any(media_type.matches(MediaType("application/vnd.project+xml")) for media_type in codec.media_types)
     with pytest.raises(TypeError):
         codec.encode({"one": 1, "two": 2})
+
+
+def test_default_registries_enable_installed_optional_codecs() -> None:
+    encoders = MediaTypeEncoders.defaults()
+    decoders = MediaTypeDecoders.defaults()
+
+    assert isinstance(encoders.find(MediaType("application/cbor")), CborCodec)
+    assert isinstance(encoders.find(MediaType("application/vnd.example+xml")), XmlCodec)
+    assert isinstance(decoders.find(MediaType("application/vnd.example+yaml")), YamlCodec)

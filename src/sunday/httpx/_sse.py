@@ -5,20 +5,28 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from collections.abc import AsyncIterator, Callable
+from contextlib import suppress
 from types import TracebackType
 from typing import TYPE_CHECKING
+from uuid import UUID, uuid4
 
 import anyio
 import httpx
 
-from ..errors import UnexpectedResponse
+from ..errors import TransportError, UnexpectedResponse
+from ..event_source import EventSourceErrorHandler, EventSourceMessageHandler, EventSourceOpenHandler, EventSourceState
 from ..media import MediaType
 from ..specs import RequestSpec
 from ..sse import EventParser, EventStreamOptions, ServerSentEvent
+from ._reconnect import _ReconnectPolicy
 
 if TYPE_CHECKING:
-    from ._transport import HttpxTransport
+    from ._transport import HttpxEventSourceRequestFactory, HttpxTransport
+
+_KEEPALIVE_TIMEOUT_FLOOR = 1.0
 
 
 class HttpxEventStream[EventT]:
@@ -28,19 +36,33 @@ class HttpxEventStream[EventT]:
         self,
         transport: HttpxTransport,
         spec: RequestSpec[None],
-        decoder: Callable[[ServerSentEvent], EventT],
+        decoder: Callable[[ServerSentEvent], EventT | None],
         *,
         options: EventStreamOptions | None = None,
+        request_factory: HttpxEventSourceRequestFactory | None = None,
+        on_open: Callable[[], None] | None = None,
+        on_error: Callable[[BaseException], None] | None = None,
+        on_connecting: Callable[[], None] | None = None,
     ) -> None:
         self._transport = transport
         self._spec = spec
         self._decoder = decoder
         self._options = options or EventStreamOptions()
+        self._request_factory = request_factory
+        self._on_open = on_open
+        self._on_error = on_error
+        self._on_connecting = on_connecting
         self._closed = False
         self._running = False
         self._response: httpx.Response | None = None
         self._cancel_scope: anyio.CancelScope | None = None
         self._close_event: anyio.Event | None = None
+        self._retry_time = self._options.retry
+
+    @property
+    def retry_time(self) -> float:
+        """Return the current initial reconnect delay in seconds."""
+        return self._retry_time
 
     def __aiter__(self) -> AsyncIterator[EventT]:
         return self.events()
@@ -48,7 +70,7 @@ class HttpxEventStream[EventT]:
     async def __aenter__(self) -> HttpxEventStream[EventT]:
         """Enter an asynchronous event-stream lifecycle scope."""
         if self._closed:
-            raise RuntimeError("HttpxEventStream is closed")
+            raise TransportError("HttpxEventStream is closed")
         return self
 
     async def __aexit__(
@@ -63,24 +85,25 @@ class HttpxEventStream[EventT]:
 
     async def aclose(self) -> None:
         """Close the active response and interrupt reads or retry waits."""
+        self._close_nowait()
+        if self._response is not None:
+            with anyio.CancelScope(shield=True):
+                await self._response.aclose()
+
+    def _close_nowait(self) -> None:
         self._closed = True
         if self._close_event is not None:
             self._close_event.set()
         if self._cancel_scope is not None:
             self._cancel_scope.cancel()
-        if self._response is not None:
-            with anyio.CancelScope(shield=True):
-                await self._response.aclose()
 
     async def events(self) -> AsyncIterator[EventT]:
         """Connect, reconnect, and yield decoded server-sent events."""
         if self._running:
-            raise RuntimeError("An event stream supports only one active consumer")
+            raise TransportError("An event stream supports only one active consumer")
         self._running = True
         self._close_event = anyio.Event()
-        retry = self._options.retry
-        retry_max = max(retry, self._options.retry_max)
-        retry_attempt = 0
+        reconnect = _ReconnectPolicy(self._options.retry, self._options.retry_max)
         last_event_id: str | None = None
 
         try:
@@ -93,8 +116,14 @@ class HttpxEventStream[EventT]:
                         headers = [("Accept", "text/event-stream"), ("Cache-Control", "no-store")]
                         if last_event_id is not None:
                             headers.append(("Last-Event-ID", last_event_id))
-                        request = self._transport.build_request(self._spec.with_headers(*headers))
-                        response = await self._transport.send(request, stream=True)
+                        if self._request_factory is None:
+                            request = self._transport._build_request(self._spec.with_headers(*headers))
+                        else:
+                            request_value = self._request_factory(tuple(headers))
+                            request = await request_value if inspect.isawaitable(request_value) else request_value
+                        request = await self._transport._adapt_request(request)
+                        self._disable_httpx_read_timeout(request)
+                        response = await self._transport._send_event_stream(request)
                         self._response = response
 
                         if response.status_code == 204:
@@ -104,38 +133,44 @@ class HttpxEventStream[EventT]:
                             self._transport.raise_problem(response, body)
                         self._validate_content_type(response)
                         connected = True
-                        retry_attempt = 0
+                        reconnect.opened()
+                        if self._on_open is not None:
+                            self._on_open()
 
                         parser = EventParser()
-                        timeout_state = [self._options.event_timeout]
+                        timeout_state: list[float | None] = [None]
 
                         def current_timeout(state: list[float | None] = timeout_state) -> float | None:
                             return state[0]
 
                         async for chunk in self._chunks(response, current_timeout):
                             for event in parser.feed(chunk):
-                                retry, retry_max, timeout_state[0], last_event_id = self._apply_controls(
+                                timeout_state[0], last_event_id = self._apply_controls(
                                     event,
-                                    retry,
-                                    retry_max,
+                                    reconnect,
                                     timeout_state[0],
                                     last_event_id,
                                 )
                                 if event.data is not None:
-                                    yield self._decoder(event)
+                                    decoded = self._decoder(event)
+                                    if decoded is not None:
+                                        yield decoded
                         for event in parser.finalize():
-                            retry, retry_max, timeout_state[0], last_event_id = self._apply_controls(
+                            timeout_state[0], last_event_id = self._apply_controls(
                                 event,
-                                retry,
-                                retry_max,
+                                reconnect,
                                 timeout_state[0],
                                 last_event_id,
                             )
                             if event.data is not None:
-                                yield self._decoder(event)
-                    except (httpx.TransportError, TimeoutError):
+                                decoded = self._decoder(event)
+                                if decoded is not None:
+                                    yield decoded
+                    except (httpx.TransportError, TimeoutError) as error:
                         if self._closed:
                             return
+                        if self._on_error is not None:
+                            self._on_error(error)
                     finally:
                         if response is not None:
                             with anyio.CancelScope(shield=True):
@@ -144,8 +179,9 @@ class HttpxEventStream[EventT]:
 
                     if self._closed:
                         return
-                    delay = min(retry * (2**retry_attempt), retry_max)
-                    retry_attempt = 0 if connected else retry_attempt + 1
+                    if self._on_connecting is not None:
+                        self._on_connecting()
+                    delay = reconnect.next_delay(failed=not connected)
                     await self._wait_for_retry(delay)
         finally:
             self._cancel_scope = None
@@ -193,17 +229,154 @@ class HttpxEventStream[EventT]:
     def _apply_controls(
         self,
         event: ServerSentEvent,
-        retry: float,
-        retry_max: float,
+        reconnect: _ReconnectPolicy,
         event_timeout: float | None,
         last_event_id: str | None,
-    ) -> tuple[float, float, float | None, str | None]:
+    ) -> tuple[float | None, str | None]:
         if event.retry is not None:
-            retry = event.retry / 1000
+            reconnect.update_retry(event.retry / 1000)
+            self._retry_time = reconnect.retry
         if event.retry_max is not None:
-            retry_max = max(retry, event.retry_max / 1000)
-        if self._options.event_timeout is None and event.keepalive is not None:
-            event_timeout = None if event.keepalive == 0 else max(event.keepalive * 3 / 1000, 1.0)
+            reconnect.update_retry_max(event.retry_max / 1000)
+        if event.keepalive is not None and event.keepalive > 0:
+            event_timeout = max(event.keepalive * 3 / 1000, _KEEPALIVE_TIMEOUT_FLOOR)
         if event.id is not None:
             last_event_id = event.id or None
-        return retry, retry_max, event_timeout, last_event_id
+        return event_timeout, last_event_id
+
+    def _disable_httpx_read_timeout(self, request: httpx.Request) -> None:
+        timeout = request.extensions.get("timeout")
+        values = dict(timeout) if isinstance(timeout, dict) else self._transport.client.timeout.as_dict()
+        values["read"] = None
+        request.extensions = {**request.extensions, "timeout": values}
+
+
+class HttpxEventSource:
+    """Callback-oriented HTTPX server-sent event source."""
+
+    def __init__(
+        self,
+        transport: HttpxTransport,
+        request_factory: HttpxEventSourceRequestFactory,
+        *,
+        options: EventStreamOptions | None = None,
+    ) -> None:
+        self._transport = transport
+        self._request_factory = request_factory
+        self._options = options or EventStreamOptions()
+        self._ready_state = EventSourceState.CLOSED
+        self._stream: HttpxEventStream[ServerSentEvent] | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._listeners: dict[str, dict[UUID, EventSourceMessageHandler]] = {}
+        self.on_open: EventSourceOpenHandler | None = None
+        self.on_error: EventSourceErrorHandler | None = None
+        self.on_message: EventSourceMessageHandler | None = None
+
+    @property
+    def ready_state(self) -> EventSourceState:
+        """Return the current connection state."""
+        return self._ready_state
+
+    @property
+    def retry_time(self) -> float:
+        """Return the current initial reconnect delay in seconds."""
+        return self._stream.retry_time if self._stream is not None else self._options.retry
+
+    def add_event_listener(self, event: str, handler: EventSourceMessageHandler) -> UUID:
+        """Register a handler for one event type and return its listener token."""
+        listener = uuid4()
+        self._listeners.setdefault(event, {})[listener] = handler
+        return listener
+
+    def remove_event_listener(self, event: str, listener: UUID) -> None:
+        """Remove a previously registered event listener."""
+        handlers = self._listeners.get(event)
+        if handlers is None:
+            return
+        handlers.pop(listener, None)
+        if not handlers:
+            self._listeners.pop(event, None)
+
+    def connect(self) -> None:
+        """Begin connecting without blocking the calling event loop."""
+        if self._ready_state is not EventSourceState.CLOSED:
+            return
+        loop = asyncio.get_running_loop()
+        if self._transport._closed:
+            raise TransportError("HttpxTransport is closed")
+        self._ready_state = EventSourceState.CONNECTING
+        self._transport._event_source_started(self)
+        self._stream = HttpxEventStream(
+            self._transport,
+            RequestSpec("GET", "/"),
+            lambda event: event,
+            options=self._options,
+            request_factory=self._request_factory,
+            on_open=self._opened,
+            on_error=self._retrying,
+            on_connecting=self._connecting,
+        )
+        self._task = loop.create_task(self._run(), name="sunday-httpx-event-source")
+
+    def close(self) -> None:
+        """Close the source and interrupt active reads or reconnect waits."""
+        self._ready_state = EventSourceState.CLOSED
+        if self._stream is not None:
+            self._stream._close_nowait()
+        if self._task is not None:
+            self._task.cancel()
+        else:
+            self._transport._event_source_closed(self)
+
+    async def _wait_closed(self) -> None:
+        task = self._task
+        if task is not None:
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _run(self) -> None:
+        try:
+            assert self._stream is not None
+            async for event in self._stream:
+                self._dispatch(event)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            self._invoke(self.on_error, error)
+        finally:
+            if self._stream is not None:
+                await self._stream.aclose()
+            self._ready_state = EventSourceState.CLOSED
+            self._transport._event_source_closed(self)
+
+    def _opened(self) -> None:
+        self._ready_state = EventSourceState.OPEN
+        self._invoke(self.on_open)
+
+    def _retrying(self, error: BaseException) -> None:
+        self._ready_state = EventSourceState.CONNECTING
+        self._invoke(self.on_error, error)
+
+    def _connecting(self) -> None:
+        self._ready_state = EventSourceState.CONNECTING
+
+    def _dispatch(self, event: ServerSentEvent) -> None:
+        self._invoke(self.on_message, event)
+        if event.event is not None:
+            for handler in tuple(self._listeners.get(event.event, {}).values()):
+                self._invoke(handler, event)
+
+    @staticmethod
+    def _invoke(handler: Callable[..., None] | None, *args: object) -> None:
+        if handler is None:
+            return
+        try:
+            handler(*args)
+        except BaseException as error:
+            asyncio.get_running_loop().call_exception_handler(
+                {
+                    "message": "Sunday EventSource callback failed",
+                    "exception": error,
+                    "callback": handler,
+                }
+            )

@@ -14,7 +14,12 @@ import anyio
 import httpx
 
 from ..codecs import JsonCodec, MediaTypeDecoders, MediaTypeEncoders
-from ..errors import SundayError, UnexpectedResponse
+from ..errors import (
+    RequestEncodingError,
+    ResponseDecodingError,
+    TransportError,
+    UnexpectedResponse,
+)
 from ..headers import ResponseHeaders
 from ..media import MediaType
 from ..multipart import MultipartBody
@@ -25,7 +30,8 @@ from ..problems import Problem, ProblemRegistry
 from ..specs import RequestSpec, ResponseSpec
 from ..sse import EventStreamOptions, ServerSentEvent
 from ..streaming import StreamingBody
-from ..transport import Transport
+from ..transport import BaseTransport
+from ..uri import URITemplate
 
 ResponseT = TypeVar("ResponseT")
 
@@ -43,40 +49,85 @@ type HttpxRequestAdapterCallable = Callable[
     Awaitable[httpx.Request | None],
 ]
 
+type HttpxEventSourceRequestFactory = Callable[
+    [tuple[tuple[str, str], ...]],
+    httpx.Request | Awaitable[httpx.Request],
+]
 
-class HttpxTransport(Transport[httpx.Request, httpx.Response]):
-    """Sunday transport implemented by an ``httpx.AsyncClient``."""
+
+class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
+    """Sunday transport using an owned internal or borrowed external ``httpx.AsyncClient``."""
 
     def __init__(
         self,
-        client: httpx.AsyncClient,
+        client: httpx.AsyncClient | None = None,
         *,
+        base_url: str | httpx.URL | None = None,
         problem_registry: ProblemRegistry | None = None,
         encoders: MediaTypeEncoders | None = None,
         decoders: MediaTypeDecoders | None = None,
         adapters: Sequence[HttpxRequestAdapter | HttpxRequestAdapterCallable] = (),
         observers: Sequence[TransportObserver] = (),
         sensitive_headers: Sequence[str] = (),
-        close_client: bool = False,
     ) -> None:
-        self.client = client
+        if client is not None and base_url is not None:
+            raise TransportError("base_url cannot be provided with a borrowed HTTPX client")
+        self._owns_client = client is None
+        self.client = client if client is not None else httpx.AsyncClient(base_url=base_url or "")
         self.problem_registry = problem_registry or ProblemRegistry()
         self.encoders = encoders or MediaTypeEncoders.defaults()
         self.decoders = decoders or MediaTypeDecoders.defaults()
         self.adapters = tuple(adapters)
         self.observers = tuple(observers)
         self.sensitive_headers = tuple(sensitive_headers)
-        self.close_client = close_client
         self._closed = False
+        self._event_sources: set[HttpxEventSource] = set()
 
     def register_problem(self, type_uri: str, problem_type: type[Problem]) -> None:
         """Register a generated problem exception for response decoding."""
         self.problem_registry.register(type_uri, problem_type)
 
-    def build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
+    async def _prepare_request(self, spec: RequestSpec[Any]) -> httpx.Request:
         """Build and adapt an HTTPX request from a declarative specification."""
+        if self._closed:
+            raise TransportError("HttpxTransport is closed")
+        try:
+            request = self._build_request(spec)
+        except RequestEncodingError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise RequestEncodingError(
+                "Request encoding failed",
+                details={"method": spec.method, "path_template": str(spec.path_template)},
+            ) from error
+        return await self._adapt_request(request)
+
+    def _build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
         parameters = encode_parameters(spec.parameters)
-        path = parameters.expand_path(spec.path_template)
+        if isinstance(spec.path_template, URITemplate):
+            template = spec.path_template.template
+            placeholders: dict[str, str] = {}
+            for index, (name, _value) in enumerate(parameters.path):
+                placeholder = "{" + name + "}"
+                if placeholder in template:
+                    token = f"__SUNDAY_PATH_PARAMETER_{index}__"
+                    template = template.replace(placeholder, token)
+                    placeholders[token] = placeholder
+            template_value = URITemplate(template, spec.path_template.parameters)
+            supplied = set(spec.path_template.parameters) | set(spec.template_parameters)
+            missing = set(template_value.variable_names) - supplied
+            if missing:
+                names = ", ".join(sorted(missing))
+                raise RequestEncodingError(
+                    f"URI template parameters are missing: {names}",
+                    details={"parameters": tuple(sorted(missing))},
+                )
+            path = template_value.expand(spec.template_parameters)
+            for token, placeholder in placeholders.items():
+                path = path.replace(token, placeholder)
+            path = parameters.expand_path(path)
+        else:
+            path = parameters.expand_path(spec.path_template)
         if parameters.query:
             path += ("&" if "?" in path else "?") + parameters.query_string
 
@@ -86,12 +137,30 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
             existing_cookie = headers.get("cookie")
             headers["cookie"] = f"{existing_cookie}; {cookie_value}" if existing_cookie else cookie_value
         if spec.accept_types and "accept" not in headers:
-            headers["accept"] = ", ".join(str(media_type) for media_type in spec.accept_types)
+            supported = tuple(
+                media_type for media_type in spec.accept_types if self.decoders.find(media_type) is not None
+            )
+            if not supported:
+                declared = ", ".join(str(media_type) for media_type in spec.accept_types)
+                raise RequestEncodingError(
+                    f"No response decoder supports any declared media type: {declared}",
+                    details={"accept_types": tuple(str(item) for item in spec.accept_types)},
+                )
+            headers["accept"] = ", ".join(str(media_type) for media_type in supported)
 
         content: Any = None
         body = spec.effective_body
         content_types = spec.effective_content_types
         if isinstance(body, MultipartBody):
+            existing_content_type = self._header_media_type(headers, "content-type")
+            declared_content_type = existing_content_type or (content_types[0] if content_types else None)
+            if declared_content_type is not None and not MediaType("multipart/form-data").matches(
+                declared_content_type
+            ):
+                raise RequestEncodingError(
+                    f"Multipart body cannot use Content-Type {declared_content_type}",
+                    details={"content_type": str(declared_content_type)},
+                )
             content = body.content()
             headers["content-type"] = str(body.content_type)
         elif isinstance(body, StreamingBody):
@@ -106,34 +175,96 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
                         yield chunk
 
                 content = async_content()
-            if content_types and "content-type" not in headers:
-                headers["content-type"] = str(content_types[0])
-        elif isinstance(body, (bytes, bytearray, memoryview)):
-            content = bytes(body)
-            content_type = content_types[0] if content_types else MediaType("application/octet-stream")
-            if "content-type" not in headers:
+            content_type = self._raw_content_type(headers, content_types)
+            if content_type is not None and "content-type" not in headers:
                 headers["content-type"] = str(content_type)
         elif body is not None:
-            content_type = content_types[0] if content_types else MediaType("application/json")
-            encoder = self.encoders.find(content_type)
-            if encoder is None:
-                raise SundayError(f"No request encoder supports {content_type}")
-            content = encoder.encode(body)
+            default = (
+                MediaType("application/octet-stream")
+                if isinstance(body, (bytes, bytearray, memoryview))
+                else MediaType("application/json")
+            )
+            try:
+                content_type, encoder = self._encoded_content_type(headers, content_types, default)
+            except RequestEncodingError:
+                if not isinstance(body, (bytes, bytearray, memoryview)):
+                    raise
+                content_type = self._raw_content_type(headers, content_types) or default
+                content = bytes(body)
+            else:
+                try:
+                    content = encoder.encode(body)
+                except (TypeError, ValueError) as error:
+                    raise RequestEncodingError(
+                        "Request body encoding failed",
+                        details={"content_type": str(content_type)},
+                    ) from error
             if "content-type" not in headers:
                 headers["content-type"] = str(content_type)
 
         return self.client.build_request(spec.method.upper(), path, headers=headers, content=content)
 
-    async def send(self, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
-        """Send a native HTTPX request."""
-        if self._closed:
-            raise RuntimeError("HttpxTransport is closed")
+    def _header_media_type(self, headers: httpx.Headers, name: str) -> MediaType | None:
+        value = headers.get(name)
+        if value is None:
+            return None
+        try:
+            return MediaType(value)
+        except ValueError as error:
+            raise RequestEncodingError(
+                f"Invalid {name.title()} header: {value}",
+                details={"header": name, "value": value},
+            ) from error
+
+    def _raw_content_type(
+        self,
+        headers: httpx.Headers,
+        declared: Sequence[MediaType],
+    ) -> MediaType | None:
+        return self._header_media_type(headers, "content-type") or (declared[0] if declared else None)
+
+    def _encoded_content_type(
+        self,
+        headers: httpx.Headers,
+        declared: Sequence[MediaType],
+        default: MediaType,
+    ) -> tuple[MediaType, Any]:
+        explicit = self._header_media_type(headers, "content-type")
+        candidates = (explicit,) if explicit is not None else tuple(declared) or (default,)
+        for media_type in candidates:
+            encoder = self.encoders.find(media_type)
+            if encoder is not None:
+                return media_type, encoder
+        choices = ", ".join(str(media_type) for media_type in candidates)
+        raise RequestEncodingError(
+            f"No request encoder supports any declared media type: {choices}",
+            details={"content_types": tuple(str(item) for item in candidates)},
+        )
+
+    async def _adapt_request(self, request: httpx.Request) -> httpx.Request:
         for adapter in self.adapters:
             adapt = getattr(adapter, "adapt", None)
             adapted = await adapt(self, request) if adapt is not None else await adapter(self, request)  # type: ignore[operator]
             if adapted is not None:
                 request = adapted
+        return request
 
+    async def _send(self, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
+        """Send a native HTTPX request."""
+        return await self._send_httpx(request, stream=stream)
+
+    async def _send_event_stream(self, request: httpx.Request) -> httpx.Response:
+        return await self._send_httpx(request, stream=True, follow_redirects=True)
+
+    async def _send_httpx(
+        self,
+        request: httpx.Request,
+        *,
+        stream: bool,
+        follow_redirects: bool | None = None,
+    ) -> httpx.Response:
+        if self._closed:
+            raise TransportError("HttpxTransport is closed")
         started = monotonic()
         self._observe(
             TransportEvent(
@@ -144,7 +275,10 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
             )
         )
         try:
-            response = await self.client.send(request, stream=stream)
+            if follow_redirects is None:
+                response = await self.client.send(request, stream=stream)
+            else:
+                response = await self.client.send(request, stream=stream, follow_redirects=follow_redirects)
         except BaseException as error:
             self._observe(
                 TransportEvent(
@@ -169,7 +303,7 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
         )
         return response
 
-    async def decode_response(
+    async def _decode_response(
         self,
         response: httpx.Response,
         responses: Sequence[ResponseSpec[Any]],
@@ -215,8 +349,17 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
         decoder = self.decoders.find(content_type)
         if decoder is None:
             raise self._unexpected(response, body, "No decoder supports the response media type")
-        decoded = decoder.decode(body, content_type)
-        result = response_spec.decoder(decoded) if response_spec.decoder is not None else decoded
+        try:
+            decoded = decoder.decode(body, content_type)
+            result = response_spec.decoder(decoded) if response_spec.decoder is not None else decoded
+        except (TypeError, ValueError) as error:
+            raise ResponseDecodingError(
+                "Response body decoding failed",
+                status=response.status_code,
+                content_type=str(content_type),
+                body=body,
+                transport_response=response,
+            ) from error
         decoded_headers = self._decode_headers(response_spec, headers, response, body)
         return OperationResponse(result, response, response.status_code, headers, decoded_headers)
 
@@ -264,7 +407,7 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
     def event_stream(
         self,
         spec: RequestSpec[None],
-        decoder: Callable[[ServerSentEvent], ResponseT],
+        decoder: Callable[[ServerSentEvent], ResponseT | None],
         *,
         options: EventStreamOptions | None = None,
     ) -> HttpxEventStream[ResponseT]:
@@ -272,6 +415,38 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
         from ._sse import HttpxEventStream
 
         return HttpxEventStream(self, spec, decoder, options=options)
+
+    def event_source(
+        self,
+        spec: RequestSpec[None],
+        *,
+        options: EventStreamOptions | None = None,
+    ) -> HttpxEventSource:
+        """Create a callback-oriented HTTPX server-sent event source."""
+
+        async def request_factory(headers: tuple[tuple[str, str], ...]) -> httpx.Request:
+            return self._build_request(spec.with_headers(*headers))
+
+        return self.event_source_from(request_factory, options=options)
+
+    def event_source_from(
+        self,
+        request_factory: HttpxEventSourceRequestFactory,
+        *,
+        options: EventStreamOptions | None = None,
+    ) -> HttpxEventSource:
+        """Create an event source from a reconnectable native request factory."""
+        from ._sse import HttpxEventSource
+
+        source = HttpxEventSource(self, request_factory, options=options)
+        self._event_sources.add(source)
+        return source
+
+    def _event_source_closed(self, source: HttpxEventSource) -> None:
+        self._event_sources.discard(source)
+
+    def _event_source_started(self, source: HttpxEventSource) -> None:
+        self._event_sources.add(source)
 
     def _unexpected(self, response: httpx.Response, body: bytes, message: str) -> UnexpectedResponse:
         return UnexpectedResponse(
@@ -287,17 +462,22 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
             observer.observe(event)
 
     async def aclose(self) -> None:
-        """Close the transport and optionally its HTTPX client exactly once."""
+        """Close owned event sources and the internal HTTPX client exactly once."""
         if self._closed:
             return
         self._closed = True
-        if self.close_client:
+        sources = tuple(self._event_sources)
+        for source in sources:
+            source.close()
+        for source in sources:
+            await source._wait_closed()
+        if self._owns_client:
             await self.client.aclose()
 
     async def __aenter__(self) -> HttpxTransport:
         """Enter an asynchronous transport lifecycle scope."""
         if self._closed:
-            raise RuntimeError("HttpxTransport is closed")
+            raise TransportError("HttpxTransport is closed")
         return self
 
     async def __aexit__(
@@ -311,9 +491,5 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
         await self.aclose()
 
 
-def as_httpx_transport(value: HttpxTransport | httpx.AsyncClient) -> HttpxTransport:
-    """Preserve the beta constructor contract by wrapping raw HTTPX clients."""
-    return value if isinstance(value, HttpxTransport) else HttpxTransport(value)
-
-
+from ._sse import HttpxEventSource as HttpxEventSource  # noqa: E402
 from ._sse import HttpxEventStream as HttpxEventStream  # noqa: E402

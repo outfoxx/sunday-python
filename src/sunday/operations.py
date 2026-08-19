@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from .headers import ResponseHeaders
 from .media import MediaType
@@ -56,21 +56,19 @@ class Operation[ResponseT, TransportRequestT, TransportResponseT]:
 
     async def execute(self) -> ResponseT:
         """Execute the operation and return its decoded result."""
-        return (await self.response()).result
+        return await self.transport.result(self.spec)
 
     async def response(self) -> OperationResponse[ResponseT, TransportResponseT]:
         """Execute the operation and include response metadata."""
-        response = await self.transport_response()
-        decoded = await self.transport.decode_response(response, self.spec.responses)
-        return cast(OperationResponse[ResponseT, TransportResponseT], decoded)
+        return await self.transport.response(self.spec)
 
-    def transport_request(self) -> TransportRequestT:
-        """Build and return a fresh native transport request."""
-        return self.transport.build_request(self.spec.request)
+    async def transport_request(self) -> TransportRequestT:
+        """Build, adapt, and return a fresh native transport request."""
+        return await self.transport.transport_request(self.spec.request)
 
     async def transport_response(self) -> TransportResponseT:
         """Send a fresh native request and return its native response."""
-        return await self.transport.send(self.transport_request())
+        return await self.transport.transport_response(await self.transport_request())
 
 
 class StreamingOperation[ResponseT, TransportRequestT, TransportResponseT](
@@ -112,9 +110,9 @@ class NullableOperation[ResponseT, TransportRequestT, TransportResponseT]:
                 return None
             raise
 
-    def transport_request(self) -> TransportRequestT:
-        """Build and return a fresh native transport request."""
-        return self._operation().transport_request()
+    async def transport_request(self) -> TransportRequestT:
+        """Build, adapt, and return a fresh native transport request."""
+        return await self._operation().transport_request()
 
     async def transport_response(self) -> TransportResponseT:
         """Send a fresh native request and return its native response."""

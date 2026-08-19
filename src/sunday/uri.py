@@ -5,13 +5,16 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime, time
 from enum import Enum
 from typing import Any
 from urllib.parse import urljoin
 
 import uritemplate
+from pydantic import BaseModel
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +23,11 @@ class URITemplate:
 
     template: str
     parameters: Mapping[str, object | None] = field(default_factory=dict)
+
+    @property
+    def variable_names(self) -> tuple[str, ...]:
+        """Return every variable referenced by the template in source order."""
+        return tuple(uritemplate.URITemplate(self.template).variable_names)
 
     def expand(self, parameters: Mapping[str, object | None] | None = None, /, **values: object | None) -> str:
         """Expand the template after applying per-call parameter overrides."""
@@ -40,7 +48,15 @@ class URITemplate:
 
 def _template_value(value: object) -> Any:
     if isinstance(value, Enum):
-        return value.value
+        return _template_value(value.value)
+    if isinstance(value, BaseModel):
+        return _template_value(value.model_dump(mode="json", by_alias=True, exclude_none=True))
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(value)).decode("ascii")
     if isinstance(value, Mapping):
         return {str(key): _template_value(item) for key, item in value.items() if item is not None}
     if isinstance(value, (list, tuple, set, frozenset)):

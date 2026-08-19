@@ -22,7 +22,22 @@ from .codecs import (
     TextCodec,
     WireMode,
 )
-from .errors import SundayError, UnexpectedResponse
+from .errors import (
+    RequestEncodingError,
+    ResponseDecodingError,
+    ResponseError,
+    ResponseValidationError,
+    SundayError,
+    TransportError,
+    UnexpectedResponse,
+)
+from .event_source import (
+    EventSource,
+    EventSourceErrorHandler,
+    EventSourceMessageHandler,
+    EventSourceOpenHandler,
+    EventSourceState,
+)
 from .headers import ResponseHeaders
 from .media import MediaType
 from .models import SundayModel, TolerantStrEnum
@@ -43,7 +58,7 @@ from .problems import Problem, ProblemPayload, ProblemRegistry
 from .specs import NullifySpec, OperationSpec, RequestPayloadSpec, RequestSpec, ResponseHeaderSpec, ResponseSpec
 from .sse import EventParser, EventStreamOptions, ServerSentEvent
 from .streaming import StreamingBody, StreamingBodyChunk, StreamingBodyClose, StreamingBodyContent
-from .transport import EventStream, ProblemRegistrar, Transport
+from .transport import BaseTransport, EventStream, ProblemRegistrar, Transport
 from .uri import URITemplate
 
 try:
@@ -52,9 +67,15 @@ except PackageNotFoundError:  # pragma: no cover - source tree without an editab
     __version__ = "0.0.0"
 
 __all__ = [
+    "BaseTransport",
     "BinaryCodec",
     "EncodedParameters",
     "EventParser",
+    "EventSource",
+    "EventSourceErrorHandler",
+    "EventSourceMessageHandler",
+    "EventSourceOpenHandler",
+    "EventSourceState",
     "EventStream",
     "EventStreamOptions",
     "FormUrlEncodedCodec",
@@ -84,11 +105,15 @@ __all__ = [
     "ProblemPayload",
     "ProblemRegistrar",
     "ProblemRegistry",
+    "RequestEncodingError",
     "RequestPayloadSpec",
     "RequestSpec",
+    "ResponseDecodingError",
+    "ResponseError",
     "ResponseHeaderSpec",
     "ResponseHeaders",
     "ResponseSpec",
+    "ResponseValidationError",
     "ServerSentEvent",
     "StreamingBody",
     "StreamingBodyChunk",
@@ -100,6 +125,7 @@ __all__ = [
     "TextCodec",
     "TolerantStrEnum",
     "Transport",
+    "TransportError",
     "TransportEvent",
     "TransportEventKind",
     "TransportObserver",

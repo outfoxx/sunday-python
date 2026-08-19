@@ -23,20 +23,97 @@ The core and adapters are separate import modules within that distribution. Gene
 applications opt into an adapter with its matching extra and import it from `sunday.<adapter>`. Installing the core alone
 does not install HTTPX or AnyIO. Importing `sunday.httpx` without its extra reports the required install command.
 
-Generated clients accept a `sunday.Transport` implementation. Applications using HTTPX construct the adapter explicitly:
+Generated clients accept a `sunday.Transport` implementation. The simplest HTTPX setup lets the transport create and own
+its client:
 
 ```python
-import httpx
 from sunday.httpx import HttpxTransport
 
 from example_api.projects import ProjectsClient
 
-http_client = httpx.AsyncClient(base_url="https://api.example.test")
-client = ProjectsClient(HttpxTransport(http_client))
+async with HttpxTransport(base_url="https://api.example.test") as transport:
+    client = ProjectsClient(transport)
+    project = await client.get_project("project-1").execute()
 ```
+
+Pass an existing client when the application needs custom HTTPX configuration or shares a pool. A supplied client is
+borrowed and remains the application's lifecycle responsibility:
+
+```python
+import httpx
+
+async with httpx.AsyncClient(base_url="https://api.example.test", timeout=30) as http_client:
+    async with HttpxTransport(http_client) as transport:
+        client = ProjectsClient(transport)
+        project = await client.get_project("project-1").execute()
+```
+
+`transport.client` exposes the active client in both modes. Supplying both a client and `base_url` is an error.
 
 Future transport adapters will follow the same module and extra convention without changing generated clients.
 Because the package is still in beta, the former `sunday.httpx_compat` and `sunday.httpx_sse` modules are not retained.
+
+## Requests and native exchange
+
+Sunday transports expose the same high-level workflow as the Kotlin, Swift, and TypeScript runtimes:
+
+| Sunday concept | Python API |
+| --- | --- |
+| Build native request | `transport_request()` |
+| Return native response | `transport_response()` |
+| Decode result with metadata | `response()` |
+| Decode result only | `result()` |
+
+`BaseTransport` implements this orchestration for custom adapters. Implementations provide protected `_prepare_request()`,
+`_send()`, and `_decode_response()` hooks. Preparation applies ordered request adapters once; generated request- and
+response-exchange methods are async and return the exact adapted request or native response used by execution.
+
+Generated clients expose their `transport`, `default_content_types`, and `default_accept_types`. Operation-specific media
+declarations take precedence when they cannot use the client defaults, and an explicit Content-Type header remains
+authoritative.
+
+## Errors
+
+Sunday-originated failures are grouped as `RequestEncodingError`, `ResponseDecodingError`, `ResponseValidationError`, and
+`TransportError`. `UnexpectedResponse` is a response-validation error retaining status, content type, body, and native
+response diagnostics. Typed RFC problems remain `Problem` exceptions, while native transport, adapter, and cancellation
+exceptions are not indiscriminately wrapped.
+
+`RequestSpec` accepts ordinary OpenAPI path placeholders or a `URITemplate` for RFC 6570 expansion. RFC template values
+are supplied separately through `template_parameters`, remain unencoded until expansion, and are not serialized again as
+ordinary operation parameters.
+
+## Media codecs
+
+Default codec registries use JSON, form-urlencoded, text, and binary codecs and automatically add installed CBOR, XML,
+and YAML extras. Their deterministic preference order is JSON, CBOR, XML, YAML, form-urlencoded, text, then binary.
+Passing a custom encoder or decoder registry is authoritative and disables this automatic composition. Request content
+negotiation honors an explicit `Content-Type`; otherwise it selects the first declared installed encoder. Generated
+`Accept` values include only installed decoders.
+
+## Server-sent events
+
+Typed `EventStream[T]` values retain the async-iterator lifecycle. Raw `EventSource` values use synchronous management on
+a running AsyncIO loop: assign `on_open`, `on_error`, or `on_message`, register event-specific listeners, call `connect()`,
+and call `close()` when finished. `connect()` returns immediately in the connecting state. The source exposes
+`ready_state` and its current `retry_time`; closing is idempotent and immediately changes the state to closed while
+response cleanup completes on the loop.
+
+HTTPX applications can construct a raw source from a declarative request with `HttpxTransport.event_source()` or from a
+synchronous or asynchronous native request factory with `event_source_from()`. Reconnect requests receive the SSE headers
+and `Last-Event-ID` before transport adapters run once.
+
+Reconnects begin at 500 ms and use capped exponential backoff. The first retry is exact; consecutive failed connections
+apply 0.9–1.0 downward jitter to later attempts. The default maximum is 30 times the current base retry, while a configured
+maximum or positive server `retry-max:` control fixes the cap. Opening a valid stream resets escalation, so a stream that
+later ends reconnects at its current base interval. Positive `retry:` and `retry-max:` values are expressed in
+milliseconds on the wire.
+
+Quiet streams have no timeout by default. A server opts into stuck-stream detection by sending a positive
+`keepalive:<milliseconds>` control, which sets the timeout to three keepalive intervals with a one-second floor. Receiving
+any bytes, including SSE comments, resets that deadline. The keepalive promise applies only to the current connection;
+each reconnect starts without a silence timeout until the server sends another positive keepalive. HTTPX read timeouts
+are disabled for SSE requests so borrowed-client settings cannot accidentally enable stuck-stream detection.
 
 ## Development
 
@@ -49,3 +126,4 @@ mise run check
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the validation and release rules.
 The [parity matrix](docs/parity.md) records the generator IR boundary and intentional exclusions for the first beta.
+The [beta migration guide](docs/migration.md) covers the breaking transport, client, ownership, and error changes.

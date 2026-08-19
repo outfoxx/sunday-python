@@ -10,11 +10,12 @@ Install ``sunday-python[httpx]`` before importing this module.
 
 try:
     from ._transport import (
+        HttpxEventSource,
+        HttpxEventSourceRequestFactory,
         HttpxEventStream,
         HttpxRequestAdapter,
         HttpxRequestAdapterCallable,
         HttpxTransport,
-        as_httpx_transport,
     )
 except ModuleNotFoundError as error:
     if error.name not in {"anyio", "httpx"}:
@@ -22,9 +23,10 @@ except ModuleNotFoundError as error:
     raise ImportError("sunday.httpx requires the 'httpx' extra; install 'sunday-python[httpx]'") from error
 
 __all__ = [
+    "HttpxEventSource",
+    "HttpxEventSourceRequestFactory",
     "HttpxEventStream",
     "HttpxRequestAdapter",
     "HttpxRequestAdapterCallable",
     "HttpxTransport",
-    "as_httpx_transport",
 ]

@@ -32,7 +32,7 @@ def test_scalar_parameter_values() -> None:
     assert parameter_value(False) == "false"
     assert parameter_value(State.ACTIVE) == "active"
     assert parameter_value(date(2026, 8, 18)) == "2026-08-18"
-    assert parameter_value(b"value") == "value"
+    assert parameter_value(b"value") == "dmFsdWU="
 
 
 def test_parameter_object_accepts_models_and_mappings() -> None:
@@ -40,6 +40,12 @@ def test_parameter_object_accepts_models_and_mappings() -> None:
     assert parameter_object({"state": "active"}) == {"state": "active"}
     with pytest.raises(TypeError):
         parameter_object("state=active")
+
+
+def test_object_parameter_serialization_accepts_models() -> None:
+    encoded = encode_parameters((ParameterSpec("filter", Query(state=State.ACTIVE), ParameterLocation.QUERY),))
+
+    assert encoded.query == (("state", "active"),)
 
 
 def test_encodes_all_parameter_locations_and_omits_none() -> None:

@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 
 from .media import MediaType
 from .parameters import ParameterSpec
+from .uri import URITemplate
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,13 +26,14 @@ class RequestSpec[RequestBodyT]:
     """Declarative HTTP request description consumed by a transport."""
 
     method: str
-    path_template: str
+    path_template: str | URITemplate
     parameters: tuple[ParameterSpec, ...] = ()
     headers: tuple[tuple[str, str], ...] = ()
     body: RequestBodyT | None = None
     content_types: tuple[MediaType, ...] = ()
     accept_types: tuple[MediaType, ...] = ()
     payload: RequestPayloadSpec[RequestBodyT] | None = None
+    template_parameters: Mapping[str, object | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.payload is not None and (self.body is not None or self.content_types):

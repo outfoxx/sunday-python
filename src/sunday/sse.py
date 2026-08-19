@@ -26,8 +26,7 @@ class EventStreamOptions:
     """Connection and retry policy for a server-sent event stream."""
 
     retry: float = 0.5
-    retry_max: float = 15.0
-    event_timeout: float | None = None
+    retry_max: float | None = None
 
 
 class EventParser:
