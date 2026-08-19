@@ -53,11 +53,11 @@ class RequestSpec[RequestBodyT]:
 
 
 @dataclass(frozen=True, slots=True)
-class ResponseHeaderSpec[HeaderT]:
+class ResponseHeaderSpec:
     """A declared response header and its generated value decoder."""
 
     name: str
-    decoder: Callable[[str], HeaderT] | None = None
+    decoder: Callable[[str], object] | None = None
     required: bool = False
     repeated: bool = False
 
@@ -70,7 +70,7 @@ class ResponseSpec[ResponseT]:
     content_types: tuple[MediaType, ...] = ()
     decoder: Callable[[object], ResponseT] | None = None
     body_expected: bool = True
-    headers: tuple[ResponseHeaderSpec[object], ...] = ()
+    headers: tuple[ResponseHeaderSpec, ...] = ()
 
     def accepts(self, media_type: MediaType | None) -> bool:
         """Return whether this response specification accepts ``media_type``."""

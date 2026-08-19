@@ -172,9 +172,10 @@ class FormUrlEncodedCodec:
 
     def encode(self, value: object) -> bytes:
         """Encode a mapping as an HTML form body."""
-        if not isinstance(value, Mapping):
+        encoded = _json_value(value, WireMode.REQUEST)
+        if not isinstance(encoded, Mapping):
             raise TypeError("Form request bodies must be mappings")
-        return urlencode(value, doseq=True).encode()
+        return urlencode(encoded, doseq=True).encode()
 
     def decode(self, value: bytes, media_type: MediaType) -> object:
         """Decode an HTML form body while preserving repeated values."""

@@ -65,7 +65,7 @@ async def test_build_request_encodes_parameters_body_headers_and_cookies() -> No
             client,
             adapters=(bearer,),
         )
-        request = await transport.build_request(
+        request = transport.build_request(
             RequestSpec(
                 "POST",
                 "/projects/{project-id}",
@@ -292,11 +292,11 @@ async def test_request_adapters_are_ordered_and_observation_is_redacted() -> Non
         transport=httpx.MockTransport(handler),
     ) as client:
         transport = HttpxTransport(client, adapters=(FirstAdapter(), second), observers=(observer,))
-        await transport.send(await transport.build_request(RequestSpec("GET", "/value")))
+        await transport.send(transport.build_request(RequestSpec("GET", "/value")))
         await transport.aclose()
         await transport.aclose()
         with pytest.raises(RuntimeError):
-            await transport.send(await transport.build_request(RequestSpec("GET", "/closed")))
+            await transport.send(transport.build_request(RequestSpec("GET", "/closed")))
 
     assert [event.kind for event in observer.events] == [TransportEventKind.REQUEST, TransportEventKind.RESPONSE]
     assert dict(observer.events[0].headers)["authorization"] == "<redacted>"

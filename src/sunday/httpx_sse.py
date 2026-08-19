@@ -93,7 +93,7 @@ class HttpxEventStream[EventT]:
                         headers = [("Accept", "text/event-stream"), ("Cache-Control", "no-store")]
                         if last_event_id is not None:
                             headers.append(("Last-Event-ID", last_event_id))
-                        request = await self._transport.build_request(self._spec.with_headers(*headers))
+                        request = self._transport.build_request(self._spec.with_headers(*headers))
                         response = await self._transport.send(request, stream=True)
                         self._response = response
 

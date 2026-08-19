@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterable, Iterable, Sequence
 from datetime import date
+from enum import StrEnum
 from typing import Any
 
 import pytest
@@ -52,13 +53,17 @@ class MissingProblem(Problem):
     pass
 
 
+class State(StrEnum):
+    ACTIVE = "active"
+
+
 class FakeTransport:
     def __init__(self, result: object = "result", problem: Problem | None = None) -> None:
         self.result = result
         self.problem = problem
         self.requests = 0
 
-    async def build_request(self, spec: RequestSpec[Any]) -> tuple[int, RequestSpec[Any]]:
+    def build_request(self, spec: RequestSpec[Any]) -> tuple[int, RequestSpec[Any]]:
         self.requests += 1
         return self.requests, spec
 
@@ -87,11 +92,15 @@ def test_builtin_codecs_and_registries() -> None:
     json_bytes = json_codec.encode(payload)
 
     assert json_bytes == b'{"created-at":"2026-08-18"}'
+    assert json_codec.encode({"state": State.ACTIVE, "date": date(2026, 8, 18)}) == (
+        b'{"state":"active","date":"2026-08-18"}'
+    )
     assert json_codec.decode(json_bytes, MediaType("application/problem+json")) == {"created-at": "2026-08-18"}
     assert TextCodec().decode("héllo".encode(), MediaType("text/plain; charset=utf-8")) == "héllo"
     assert BinaryCodec().encode(memoryview(b"abc")) == b"abc"
     assert BinaryCodec().decode(b"abc", MediaType("application/octet-stream")) == b"abc"
     assert FormUrlEncodedCodec().encode({"tag": ["one", "two"]}) == b"tag=one&tag=two"
+    assert FormUrlEncodedCodec().encode(payload) == b"created-at=2026-08-18"
     assert FormUrlEncodedCodec().decode(
         b"tag=one&tag=two&empty=",
         MediaType("application/x-www-form-urlencoded"),
@@ -191,7 +200,7 @@ async def test_operation_builds_fresh_requests_and_returns_metadata() -> None:
 
     assert await operation.execute() == "result"
     assert (await operation.response()).content_type == MediaType("application/json")
-    assert await operation.transport_request() == (3, spec.request)
+    assert operation.transport_request() == (3, spec.request)
     assert await operation.transport_response() == ((4, spec.request), False)
 
 

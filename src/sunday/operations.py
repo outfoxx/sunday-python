@@ -61,13 +61,13 @@ class Operation[ResponseT]:
         decoded = await self.transport.decode_response(response, self.spec.responses)
         return cast(OperationResponse[ResponseT], decoded)
 
-    async def transport_request(self) -> Any:
+    def transport_request(self) -> Any:
         """Build and return a fresh native transport request."""
-        return await self.transport.build_request(self.spec.request)
+        return self.transport.build_request(self.spec.request)
 
     async def transport_response(self) -> Any:
         """Send a fresh native request and return its native response."""
-        return await self.transport.send(await self.transport_request())
+        return await self.transport.send(self.transport_request())
 
 
 class StreamingOperation[ResponseT](Operation[ResponseT]):
@@ -107,9 +107,9 @@ class NullableOperation[ResponseT]:
                 return None
             raise
 
-    async def transport_request(self) -> Any:
+    def transport_request(self) -> Any:
         """Build and return a fresh native transport request."""
-        return await self._operation().transport_request()
+        return self._operation().transport_request()
 
     async def transport_response(self) -> Any:
         """Send a fresh native request and return its native response."""

@@ -35,6 +35,7 @@ from .parameters import (
     ParameterSpec,
     ParameterStyle,
     encode_parameters,
+    parameter_object,
     parameter_value,
 )
 from .patch import MergePatch, PatchDocument, PatchOperation, PatchOperationKind
@@ -105,5 +106,6 @@ __all__ = [
     "WireMode",
     "__version__",
     "encode_parameters",
+    "parameter_object",
     "parameter_value",
 ]

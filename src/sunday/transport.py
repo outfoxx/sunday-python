@@ -16,7 +16,7 @@ from .specs import RequestSpec, ResponseSpec
 class Transport(Protocol):
     """Transport contract used by generated operations."""
 
-    async def build_request(self, spec: RequestSpec[Any]) -> Any:
+    def build_request(self, spec: RequestSpec[Any]) -> Any:
         """Build a native request from a declarative request specification."""
         ...
 

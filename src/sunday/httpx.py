@@ -72,7 +72,7 @@ class HttpxTransport:
         """Register a generated problem exception for response decoding."""
         self.problem_registry.register(type_uri, problem_type)
 
-    async def build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
+    def build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
         """Build and adapt an HTTPX request from a declarative specification."""
         parameters = encode_parameters(spec.parameters)
         path = parameters.expand_path(spec.path_template)
@@ -107,6 +107,11 @@ class HttpxTransport:
                 content = async_content()
             if content_types and "content-type" not in headers:
                 headers["content-type"] = str(content_types[0])
+        elif isinstance(body, (bytes, bytearray, memoryview)):
+            content = bytes(body)
+            content_type = content_types[0] if content_types else MediaType("application/octet-stream")
+            if "content-type" not in headers:
+                headers["content-type"] = str(content_type)
         elif body is not None:
             content_type = content_types[0] if content_types else MediaType("application/json")
             encoder = self.encoders.find(content_type)
@@ -310,4 +315,4 @@ def as_httpx_transport(value: HttpxTransport | httpx.AsyncClient) -> HttpxTransp
     return value if isinstance(value, HttpxTransport) else HttpxTransport(value)
 
 
-from .httpx_sse import HttpxEventStream  # noqa: E402
+from .httpx_sse import HttpxEventStream as HttpxEventStream  # noqa: E402

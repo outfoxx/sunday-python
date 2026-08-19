@@ -12,6 +12,8 @@ from enum import Enum, StrEnum
 from typing import TypeGuard
 from urllib.parse import quote
 
+from pydantic import BaseModel
+
 
 class ParameterLocation(StrEnum):
     """Location of an HTTP operation parameter."""
@@ -44,6 +46,7 @@ class ParameterSpec:
     style: ParameterStyle | None = None
     explode: bool | None = None
     allow_reserved: bool = False
+    allow_empty_value: bool = False
 
     @property
     def effective_style(self) -> ParameterStyle:
@@ -120,6 +123,15 @@ def parameter_value(value: object) -> str:
     return str(value)
 
 
+def parameter_object(value: object) -> Mapping[str, object]:
+    """Convert a generated query object to its alias-preserving wire mapping."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json", by_alias=True, exclude_none=True)
+    if isinstance(value, Mapping):
+        return value
+    raise TypeError("Object parameters must be mappings or Pydantic models")
+
+
 def _encode_path(parameter: ParameterSpec) -> str:
     style = parameter.effective_style
     explode = parameter.effective_explode
@@ -169,17 +181,25 @@ def _encode_query(parameter: ParameterSpec) -> list[tuple[str, str]]:
     name = _quote(parameter.name, parameter.allow_reserved)
 
     if isinstance(value, Mapping):
-        items = [
-            (_quote(key, parameter.allow_reserved), _quote(item, parameter.allow_reserved))
-            for key, item in value.items()
-        ]
+        items: list[tuple[str, str]] = []
+        for key, item in value.items():
+            if item is None:
+                continue
+            encoded_key = _quote(key, parameter.allow_reserved)
+            if _is_sequence(item):
+                items.extend((encoded_key, _quote(member, parameter.allow_reserved)) for member in item)
+            else:
+                items.append((encoded_key, _quote(item, parameter.allow_reserved)))
         if style == ParameterStyle.DEEP_OBJECT:
             return [(f"{name}%5B{key}%5D", item) for key, item in items]
         if style != ParameterStyle.FORM:
             raise ValueError(f"Style {style} is not valid for object query parameters")
         if explode:
             return items
-        return [(name, ",".join(part for item in items for part in item))]
+        grouped: list[str] = []
+        for key, item in items:
+            grouped.extend((key, item))
+        return [(name, ",".join(grouped))]
 
     if _is_sequence(value):
         values = [_quote(item, parameter.allow_reserved) for item in value]

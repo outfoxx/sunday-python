@@ -8,11 +8,23 @@ from enum import StrEnum
 
 import pytest
 
-from sunday import ParameterLocation, ParameterSpec, ParameterStyle, encode_parameters, parameter_value
+from sunday import (
+    ParameterLocation,
+    ParameterSpec,
+    ParameterStyle,
+    SundayModel,
+    encode_parameters,
+    parameter_object,
+    parameter_value,
+)
 
 
 class State(StrEnum):
     ACTIVE = "active"
+
+
+class Query(SundayModel):
+    state: State
 
 
 def test_scalar_parameter_values() -> None:
@@ -23,12 +35,20 @@ def test_scalar_parameter_values() -> None:
     assert parameter_value(b"value") == "value"
 
 
+def test_parameter_object_accepts_models_and_mappings() -> None:
+    assert parameter_object(Query(state=State.ACTIVE)) == {"state": "active"}
+    assert parameter_object({"state": "active"}) == {"state": "active"}
+    with pytest.raises(TypeError):
+        parameter_object("state=active")
+
+
 def test_encodes_all_parameter_locations_and_omits_none() -> None:
     encoded = encode_parameters(
         (
             ParameterSpec("project-id", "a/b", ParameterLocation.PATH),
             ParameterSpec("tag", ["one", "two"], ParameterLocation.QUERY),
             ParameterSpec("filter", {"state": "active", "owner": "a/b"}, ParameterLocation.QUERY),
+            ParameterSpec("", {"tags": ["one", "two"]}, ParameterLocation.QUERY),
             ParameterSpec("X-Flags", ["one", "two"], ParameterLocation.HEADER),
             ParameterSpec("session", "abc", ParameterLocation.COOKIE),
             ParameterSpec("missing", None, ParameterLocation.QUERY),
@@ -36,10 +56,42 @@ def test_encodes_all_parameter_locations_and_omits_none() -> None:
     )
 
     assert encoded.expand_path("/projects/{project-id}") == "/projects/a%2Fb"
-    assert encoded.query == (("tag", "one"), ("tag", "two"), ("state", "active"), ("owner", "a%2Fb"))
-    assert encoded.query_string == "tag=one&tag=two&state=active&owner=a%2Fb"
+    assert encoded.query == (
+        ("tag", "one"),
+        ("tag", "two"),
+        ("state", "active"),
+        ("owner", "a%2Fb"),
+        ("tags", "one"),
+        ("tags", "two"),
+    )
+    assert encoded.query_string == "tag=one&tag=two&state=active&owner=a%2Fb&tags=one&tags=two"
     assert encoded.headers == (("X-Flags", "one,two"),)
     assert encoded.cookies == (("session", "abc"),)
+
+
+def test_object_query_values_support_nulls_sequences_and_compact_form() -> None:
+    exploded = encode_parameters(
+        (
+            ParameterSpec(
+                "filter",
+                {"ignored": None, "tags": ["one", "two"], "state": "active"},
+                ParameterLocation.QUERY,
+            ),
+        )
+    )
+    compact = encode_parameters(
+        (
+            ParameterSpec(
+                "filter",
+                {"tags": ["one", "two"], "state": "active"},
+                ParameterLocation.QUERY,
+                ParameterStyle.FORM,
+                False,
+            ),
+        )
+    )
+    assert exploded.query == (("tags", "one"), ("tags", "two"), ("state", "active"))
+    assert compact.query == (("filter", "tags,one,tags,two,state,active"),)
 
 
 @pytest.mark.parametrize(
