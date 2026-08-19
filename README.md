@@ -4,20 +4,33 @@ Sunday Python is the shared HTTP runtime for Python clients and servers generate
 [Sunday Generator](https://github.com/outfoxx/sunday-generator). It provides declarative operations, typed RFC problem
 responses, media codecs, parameter serialization, reusable streaming bodies, and server-sent event support.
 
-The package is currently under local development. No public release has been published.
+The package is currently in beta. No PyPI release has been published yet.
 
 ## Installation
 
-Generated clients require only the transport-neutral core. Install an adapter separately when the application chooses one:
+Until the first PyPI release, install Sunday Python from its GitHub beta tag. A `requirements.txt` entry for the
+transport-neutral core is:
 
-```shell
-pip install sunday-python
-pip install "sunday-python[httpx]"
-pip install "sunday-python[litestar]"
-pip install "sunday-python[httpx,litestar,cbor,xml,yaml]"
+```text
+sunday-python @ git+https://github.com/outfoxx/sunday-python.git@2.0.0-beta.1
 ```
 
-The distribution is named `sunday-python`; public APIs are imported from `sunday`.
+Select adapters and optional codecs with extras:
+
+```text
+sunday-python[httpx] @ git+https://github.com/outfoxx/sunday-python.git@2.0.0-beta.1
+sunday-python[litestar] @ git+https://github.com/outfoxx/sunday-python.git@2.0.0-beta.1
+sunday-python[httpx,litestar,cbor,xml,yaml] @ git+https://github.com/outfoxx/sunday-python.git@2.0.0-beta.1
+```
+
+Install the requirements with pip:
+
+```shell
+python -m pip install -r requirements.txt
+```
+
+Git must be available for this temporary VCS-based installation. The distribution is named `sunday-python`; public APIs
+are imported from `sunday`. These instructions will switch to ordinary PyPI version requirements after publication.
 
 The core and adapters are separate import modules within that distribution. Generated clients depend only on `sunday`;
 applications opt into an adapter with its matching extra and import it from `sunday.<adapter>`. Installing the core alone
