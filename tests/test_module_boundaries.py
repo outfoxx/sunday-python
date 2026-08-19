@@ -91,12 +91,9 @@ else:
 
 def test_core_source_does_not_import_httpx_adapter() -> None:
     source_root = Path(sunday.__file__).parent
-    adapter_shims = {"httpx_compat.py", "httpx_sse.py"}
     violations: list[str] = []
 
     for source in source_root.glob("*.py"):
-        if source.name in adapter_shims:
-            continue
         tree = ast.parse(source.read_text(), filename=str(source))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

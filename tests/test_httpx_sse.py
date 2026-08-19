@@ -13,7 +13,6 @@ import pytest
 
 from sunday import EventStreamOptions, Problem, RequestSpec, UnexpectedResponse
 from sunday.httpx import HttpxEventStream, HttpxTransport
-from sunday.httpx_sse import HttpxEventStream as CompatibilityHttpxEventStream
 
 
 class Chunks(httpx.AsyncByteStream):
@@ -57,10 +56,6 @@ class ControlledBlocking(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:
         self.closed = True
-
-
-def test_event_stream_compatibility_import() -> None:
-    assert CompatibilityHttpxEventStream is HttpxEventStream
 
 
 @pytest.mark.anyio

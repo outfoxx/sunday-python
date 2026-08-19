@@ -101,7 +101,7 @@ jobs:
           httpx_venv="${RUNNER_TEMP}/sunday-httpx"
           uv venv --python 3.12 "$httpx_venv"
           uv pip install --python "$httpx_venv/bin/python" "${wheel}[httpx]"
-          "$httpx_venv/bin/python" -c "from sunday.httpx import HttpxEventStream, HttpxTransport; from sunday.httpx_compat import Operation; from sunday.httpx_sse import HttpxEventStream as LegacyEventStream; assert LegacyEventStream is HttpxEventStream"
+          "$httpx_venv/bin/python" -c "from sunday.httpx import HttpxEventStream, HttpxTransport"
       - name: Smoke remaining optional modules
         run: |
           wheel="$(find dist -name '*.whl' -print -quit)"

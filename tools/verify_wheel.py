@@ -27,10 +27,10 @@ def main() -> None:
         "sunday/httpx/__init__.py",
         "sunday/httpx/_transport.py",
         "sunday/httpx/_sse.py",
-        "sunday/httpx_compat.py",
-        "sunday/httpx_sse.py",
     }
     assert expected_files <= names, expected_files - names
+    assert "sunday/httpx_compat.py" not in names
+    assert "sunday/httpx_sse.py" not in names
 
     requirements = [Requirement(value) for value in metadata.get_all("Requires-Dist", [])]
     for dependency in ("anyio", "httpx"):

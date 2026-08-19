@@ -36,6 +36,7 @@ client = ProjectsClient(HttpxTransport(http_client))
 ```
 
 Future transport adapters will follow the same module and extra convention without changing generated clients.
+Because the package is still in beta, the former `sunday.httpx_compat` and `sunday.httpx_sse` modules are not retained.
 
 ## Development
 
