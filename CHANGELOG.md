@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Split the optional HTTPX implementation into a dedicated `sunday.httpx` package while keeping one `sunday-python`
+  distribution and preserving the beta compatibility import modules.
 - Establish the Sunday Python runtime, HTTPX transport, Litestar integration, and server-sent event support.
 - Add URI templates, multipart and patch bodies, typed response headers, XML/YAML codecs, transport lifecycle and
   observation, and closure-based HTTPX request adapters.

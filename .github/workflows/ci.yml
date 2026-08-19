@@ -26,9 +26,9 @@ jobs:
           python-version: ${{ matrix.python }}
           enable-cache: true
       - run: uv sync --locked --all-extras
-      - run: uv run ruff format --check src tests
-      - run: uv run ruff check src tests
-      - run: uv run mypy src tests
+      - run: uv run ruff format --check src tests tools
+      - run: uv run ruff check src tests tools
+      - run: uv run mypy src tests tools
       - run: uv run pytest --cov=sunday --cov-report=term-missing
 
   minimum-dependencies:
@@ -58,8 +58,52 @@ jobs:
       - run: uv sync --locked --all-extras
       - run: uv build
       - run: uv run twine check dist/*
-      - name: Smoke built wheel
+      - name: Verify wheel metadata
         run: |
           wheel="$(find dist -name '*.whl' -print -quit)"
-          uv run --isolated --with "$wheel" --with httpx --with litestar --with cbor2 \
-            python -c "import sunday; import sunday.httpx; import sunday.litestar; import sunday.cbor; print(sunday.__version__)"
+          uv run python tools/verify_wheel.py "$wheel"
+      - name: Smoke core-only wheel
+        run: |
+          wheel="$(find dist -name '*.whl' -print -quit)"
+          core_venv="${RUNNER_TEMP}/sunday-core"
+          uv venv --python 3.12 "$core_venv"
+          uv pip install --python "$core_venv/bin/python" "$wheel"
+          "$core_venv/bin/python" - <<'PY'
+          import importlib.metadata as metadata
+          import sys
+
+          import sunday
+
+          assert "httpx" not in sys.modules
+          assert "anyio" not in sys.modules
+          for name in ("httpx", "anyio"):
+              try:
+                  metadata.version(name)
+              except metadata.PackageNotFoundError:
+                  pass
+              else:
+                  raise AssertionError(f"{name} was installed")
+          PY
+      - name: Verify core-only missing-extra diagnostic
+        run: |
+          core_venv="${RUNNER_TEMP}/sunday-core"
+          "$core_venv/bin/python" - <<'PY'
+          try:
+              import sunday.httpx
+          except ImportError as error:
+              assert str(error) == "sunday.httpx requires the 'httpx' extra; install 'sunday-python[httpx]'"
+          else:
+              raise AssertionError("sunday.httpx imported without its extra")
+          PY
+      - name: Smoke HTTPX wheel extra
+        run: |
+          wheel="$(find dist -name '*.whl' -print -quit)"
+          httpx_venv="${RUNNER_TEMP}/sunday-httpx"
+          uv venv --python 3.12 "$httpx_venv"
+          uv pip install --python "$httpx_venv/bin/python" "${wheel}[httpx]"
+          "$httpx_venv/bin/python" -c "from sunday.httpx import HttpxEventStream, HttpxTransport; from sunday.httpx_compat import Operation; from sunday.httpx_sse import HttpxEventStream as LegacyEventStream; assert LegacyEventStream is HttpxEventStream"
+      - name: Smoke remaining optional modules
+        run: |
+          wheel="$(find dist -name '*.whl' -print -quit)"
+          uv run --isolated --with "${wheel}[litestar,cbor,xml,yaml]" \
+            python -c "import sunday.litestar; import sunday.cbor; import sunday.xml; import sunday.yaml"

@@ -13,19 +13,19 @@ from typing import Any, Protocol, TypeVar
 import anyio
 import httpx
 
-from .codecs import JsonCodec, MediaTypeDecoders, MediaTypeEncoders
-from .errors import SundayError, UnexpectedResponse
-from .headers import ResponseHeaders
-from .media import MediaType
-from .multipart import MultipartBody
-from .observers import TransportEvent, TransportEventKind, TransportObserver, redact_headers
-from .operations import OperationResponse
-from .parameters import encode_parameters
-from .problems import Problem, ProblemRegistry
-from .specs import RequestSpec, ResponseSpec
-from .sse import EventStreamOptions, ServerSentEvent
-from .streaming import StreamingBody
-from .transport import Transport
+from ..codecs import JsonCodec, MediaTypeDecoders, MediaTypeEncoders
+from ..errors import SundayError, UnexpectedResponse
+from ..headers import ResponseHeaders
+from ..media import MediaType
+from ..multipart import MultipartBody
+from ..observers import TransportEvent, TransportEventKind, TransportObserver, redact_headers
+from ..operations import OperationResponse
+from ..parameters import encode_parameters
+from ..problems import Problem, ProblemRegistry
+from ..specs import RequestSpec, ResponseSpec
+from ..sse import EventStreamOptions, ServerSentEvent
+from ..streaming import StreamingBody
+from ..transport import Transport
 
 ResponseT = TypeVar("ResponseT")
 
@@ -269,7 +269,7 @@ class HttpxTransport(Transport[httpx.Request, httpx.Response]):
         options: EventStreamOptions | None = None,
     ) -> HttpxEventStream[ResponseT]:
         """Create a reconnecting typed HTTPX server-sent event stream."""
-        from .httpx_sse import HttpxEventStream
+        from ._sse import HttpxEventStream
 
         return HttpxEventStream(self, spec, decoder, options=options)
 
@@ -316,4 +316,4 @@ def as_httpx_transport(value: HttpxTransport | httpx.AsyncClient) -> HttpxTransp
     return value if isinstance(value, HttpxTransport) else HttpxTransport(value)
 
 
-from .httpx_sse import HttpxEventStream as HttpxEventStream  # noqa: E402
+from ._sse import HttpxEventStream as HttpxEventStream  # noqa: E402

@@ -19,6 +19,10 @@ pip install "sunday-python[httpx,litestar,cbor,xml,yaml]"
 
 The distribution is named `sunday-python`; public APIs are imported from `sunday`.
 
+The core and adapters are separate import modules within that distribution. Generated clients depend only on `sunday`;
+applications opt into an adapter with its matching extra and import it from `sunday.<adapter>`. Installing the core alone
+does not install HTTPX or AnyIO. Importing `sunday.httpx` without its extra reports the required install command.
+
 Generated clients accept a `sunday.Transport` implementation. Applications using HTTPX construct the adapter explicitly:
 
 ```python
@@ -30,6 +34,8 @@ from example_api.projects import ProjectsClient
 http_client = httpx.AsyncClient(base_url="https://api.example.test")
 client = ProjectsClient(HttpxTransport(http_client))
 ```
+
+Future transport adapters will follow the same module and extra convention without changing generated clients.
 
 ## Development
 

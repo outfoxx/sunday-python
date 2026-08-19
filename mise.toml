@@ -6,16 +6,16 @@ uv = "latest"
 depends = ["format-check", "lint", "typecheck", "test", "build"]
 
 [tasks.format]
-run = "uv run ruff format src tests"
+run = "uv run ruff format src tests tools"
 
 [tasks.format-check]
-run = "uv run ruff format --check src tests"
+run = "uv run ruff format --check src tests tools"
 
 [tasks.lint]
-run = "uv run ruff check src tests"
+run = "uv run ruff check src tests tools"
 
 [tasks.typecheck]
-run = "uv run mypy src tests"
+run = "uv run mypy src tests tools"
 
 [tasks.test]
 run = "uv run pytest --cov=sunday --cov-report=term-missing"
