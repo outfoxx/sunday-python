@@ -63,6 +63,18 @@ async with httpx.AsyncClient(base_url="https://api.example.test", timeout=30) as
 
 `transport.client` exposes the active client in both modes. Supplying both a client and `base_url` is an error.
 
+## Litestar binary requests
+
+Generated Litestar handlers can call `await sunday.litestar.request_bytes(request, media_types)` for a whole binary body.
+The helper reads the original bytes without JSON/base64 decoding and uses the shared `MediaType` matcher to check every
+declared range, including `image/*` and `*/*`. Unsupported media produces HTTP 415; malformed Content-Type produces
+HTTP 400. An absent header is treated as `application/octet-stream`, and an empty range list accepts any concrete media
+type. Matching ignores case and media parameters while explicit header arguments preserve the original value.
+Litestar's request body size limit continues to apply.
+
+Keep JSON/base64 values and binary fields within models on the structured decoding path. The binary helper is for the
+whole request body. It is new after `2.0.0-beta.1`; use this checkout until a tag containing the helper is released.
+
 Future transport adapters will follow the same module and extra convention without changing generated clients.
 Because the package is still in beta, the former `sunday.httpx_compat` and `sunday.httpx_sse` modules are not retained.
 
