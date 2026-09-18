@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -13,6 +14,7 @@ from typing import Any
 
 from litestar import Request
 from litestar.config.app import AppConfig
+from litestar.exceptions import HTTPException
 from litestar.plugins.pydantic import PydanticPlugin
 from litestar.response import Response
 from pydantic import BaseModel, TypeAdapter
@@ -96,6 +98,24 @@ def query_model[ModelT](model_type: type[ModelT], request: Request[Any, Any, Any
         else:
             values[name] = [previous, value]
     return TypeAdapter(model_type).validate_python(values)
+
+
+async def request_bytes(request: Request[Any, Any, Any], media_types: Sequence[str]) -> bytes:
+    """Read a binary body without JSON decoding, enforcing the declared media ranges.
+
+    An absent Content-Type is treated as application/octet-stream. An empty list
+    of ranges leaves the body unconstrained. Parameters do not affect matching;
+    explicit header arguments retain their original value for application use.
+    """
+    try:
+        actual = MediaType(request.headers.get("content-type", "application/octet-stream"))
+        if any(re.fullmatch(r"[!#$%&'+.\^_`|~0-9A-Za-z-]+", token) is None for token in (actual.type, actual.subtype)):
+            raise ValueError("Content-Type must be a concrete media type")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Invalid Content-Type header") from error
+    if media_types and not any(MediaType(media_type).matches(actual) for media_type in media_types):
+        raise HTTPException(status_code=415, detail="Unsupported request media type")
+    return await request.body()
 
 
 async def request_model[ModelT](
