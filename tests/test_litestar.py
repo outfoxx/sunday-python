@@ -130,3 +130,33 @@ def test_optional_yaml_and_xml_request_response_models() -> None:
     assert yaml_response.text == "name: Roadmap\n"
     assert xml_response.headers["content-type"].startswith("application/xml")
     assert "<Configuration><name>Roadmap</name></Configuration>" in xml_response.text
+
+
+def test_server_sent_events_preserve_explicit_nulls() -> None:
+    import asyncio
+
+    class NullableEvent(SundayModel):
+        required_nullable: str | None = Field(alias="requiredNullable")
+        optional_text: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    async def events() -> AsyncIterable[NullableEvent]:
+        yield NullableEvent(required_nullable=None)
+
+    async def collect() -> list[str]:
+        return [value async for value in server_sent_events(events())]
+
+    assert asyncio.run(collect()) == ['{"requiredNullable":null}']
+
+
+def test_problem_response_preserves_nullable_extension_fields() -> None:
+    class NullableProblemPayload(ProblemPayload):
+        required_nullable: str | None = Field(alias="requiredNullable")
+
+    @get("/nullable-problem")
+    async def nullable_problem() -> None:
+        raise Problem(NullableProblemPayload(status=400, required_nullable=None))
+
+    with TestClient(Litestar(route_handlers=[nullable_problem], plugins=[SundayPlugin()])) as client:
+        response = client.get("/nullable-problem")
+    assert response.status_code == 400
+    assert response.json() == {"type": "about:blank", "status": 400, "requiredNullable": None}

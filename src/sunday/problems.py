@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, ClassVar, Self
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 
 from .models import SundayModel
 
@@ -19,10 +19,10 @@ class ProblemPayload(SundayModel):
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True, extra="allow")
 
     type: str = "about:blank"
-    title: str | None = None
-    status: int | None = None
-    detail: str | None = None
-    instance: str | None = None
+    title: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    status: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    detail: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    instance: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class Problem(Exception):
