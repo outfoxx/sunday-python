@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Sequence
 from datetime import UTC, date, datetime
 from enum import StrEnum
@@ -403,3 +404,23 @@ async def test_nullable_operation_matches_status_and_problem_type() -> None:
     )
     with pytest.raises(Problem):
         await unmatched.execute_or_none()
+
+
+@pytest.mark.parametrize("wire_mode", list(WireMode))
+def test_json_codec_preserves_nullable_fields_and_omits_absent_non_nullable_fields(wire_mode: WireMode) -> None:
+    class Presence(SundayModel):
+        required_nullable: str | None = Field(alias="requiredNullable")
+        optional_nullable: str | None = Field(default=None, alias="optionalNullable")
+        optional_text: str | None = Field(default=None, alias="optionalText", exclude_if=lambda value: value is None)
+        text: str = ""
+        count: int = 0
+        flag: bool = False
+        items: list[str] = Field(default_factory=list)
+
+    value = Presence(requiredNullable=None, optionalNullable=None, text="", count=0, flag=False, items=[])
+    expected = {"requiredNullable": None, "optionalNullable": None, "text": "", "count": 0, "flag": False, "items": []}
+    codec = JsonCodec(wire_mode=wire_mode)
+    assert json.loads(codec.encode(value)) == expected
+    assert json.loads(codec.encode({"nested": [value]})) == {"nested": [expected]}
+    value.optional_text = "main"
+    assert json.loads(codec.encode(value)) == dict(expected, optionalText="main")

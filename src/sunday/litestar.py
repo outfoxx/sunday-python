@@ -80,7 +80,7 @@ def problem_exception_handler(_request: Request[Any, Any, Any], exc: Problem) ->
     """Render a Sunday problem as an ``application/problem+json`` response."""
     status = exc.status if exc.status is not None and 100 <= exc.status <= 599 else 500
     return Response(
-        content=exc.model_dump(mode="json", by_alias=True, exclude_none=True),
+        content=exc.model_dump(mode="json", by_alias=True),
         status_code=status,
         media_type="application/problem+json",
     )
@@ -142,7 +142,7 @@ async def server_sent_events(events: AsyncIterable[BaseModel | str | bytes]) -> 
     """Serialize generated event models for Litestar's ``ServerSentEvent`` response."""
     async for event in events:
         if isinstance(event, BaseModel):
-            yield event.model_dump_json(by_alias=True, exclude_none=True)
+            yield event.model_dump_json(by_alias=True)
         elif isinstance(event, bytes):
             yield event.decode()
         else:

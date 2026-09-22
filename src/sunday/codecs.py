@@ -197,7 +197,7 @@ def _json_value(value: object, wire_mode: WireMode = WireMode.REQUEST) -> object
     if isinstance(value, BaseModel):
         if wire_mode in {WireMode.REQUEST, WireMode.PATCH}:
             return value.model_dump(mode="json", by_alias=True, exclude_unset=True)
-        return value.model_dump(mode="json", by_alias=True, exclude_none=True)
+        return value.model_dump(mode="json", by_alias=True)
     if isinstance(value, Enum):
         return _json_value(value.value, wire_mode)
     if isinstance(value, (datetime, date, time, UUID)):
