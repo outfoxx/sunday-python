@@ -417,8 +417,15 @@ def test_json_codec_preserves_nullable_fields_and_omits_absent_non_nullable_fiel
         flag: bool = False
         items: list[str] = Field(default_factory=list)
 
-    value = Presence(requiredNullable=None, optionalNullable=None, text="", count=0, flag=False, items=[])
-    expected = {"requiredNullable": None, "optionalNullable": None, "text": "", "count": 0, "flag": False, "items": []}
+    value = Presence(required_nullable=None, optional_nullable=None, text="", count=0, flag=False, items=[])
+    expected: dict[str, object] = {
+        "requiredNullable": None,
+        "optionalNullable": None,
+        "text": "",
+        "count": 0,
+        "flag": False,
+        "items": [],
+    }
     codec = JsonCodec(wire_mode=wire_mode)
     assert json.loads(codec.encode(value)) == expected
     assert json.loads(codec.encode({"nested": [value]})) == {"nested": [expected]}

@@ -140,7 +140,7 @@ def test_server_sent_events_preserve_explicit_nulls() -> None:
         optional_text: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
     async def events() -> AsyncIterable[NullableEvent]:
-        yield NullableEvent(requiredNullable=None)
+        yield NullableEvent(required_nullable=None)
 
     async def collect() -> list[str]:
         return [value async for value in server_sent_events(events())]
@@ -154,7 +154,7 @@ def test_problem_response_preserves_nullable_extension_fields() -> None:
 
     @get("/nullable-problem")
     async def nullable_problem() -> None:
-        raise Problem(NullableProblemPayload(status=400, requiredNullable=None))
+        raise Problem(NullableProblemPayload(status=400, required_nullable=None))
 
     with TestClient(Litestar(route_handlers=[nullable_problem], plugins=[SundayPlugin()])) as client:
         response = client.get("/nullable-problem")
