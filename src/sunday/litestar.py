@@ -168,21 +168,26 @@ async def request_model[ModelT](
     """Decode JSON, XML, or YAML in request mode, including a union's native TypeAdapter."""
     body = await request.body()
     adapter = model_type if isinstance(model_type, TypeAdapter) else TypeAdapter(model_type)
-    if media_type.endswith("+json") or media_type == "application/json":
+    parsed_media_type = MediaType(media_type)
+    if parsed_media_type.is_json:
         try:
             return adapter.validate_json(body, context={"mode": "request"})
         except ValidationError as error:
             raise ValidationException(
                 detail="Request entity is invalid", extra=error.errors(include_input=False)
             ) from error
-    if media_type.endswith("+xml") or media_type in {"application/xml", "text/xml"}:
+    if parsed_media_type.suffix == "xml" or (
+        parsed_media_type.type in {"application", "text"} and parsed_media_type.subtype == "xml"
+    ):
         from .xml import XmlCodec
 
-        value = XmlCodec().decode(body, MediaType(media_type))
-    elif media_type.endswith("+yaml") or media_type in {"application/yaml", "text/yaml"}:
+        value = XmlCodec().decode(body, parsed_media_type)
+    elif parsed_media_type.suffix == "yaml" or (
+        parsed_media_type.type in {"application", "text"} and parsed_media_type.subtype == "yaml"
+    ):
         from .yaml import YamlCodec
 
-        value = YamlCodec().decode(body, MediaType(media_type))
+        value = YamlCodec().decode(body, parsed_media_type)
     else:
         raise ValueError(f"Sunday request_model does not support {media_type}")
     try:

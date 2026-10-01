@@ -392,7 +392,17 @@ def test_litestar_native_containers_and_optional_models_preserve_request_mode(
         assert calls == 1
 
 
-def test_litestar_union_request_adapter_rejects_unknowns_before_application_invocation() -> None:
+@pytest.mark.parametrize(
+    "media_type",
+    [
+        "application/json",
+        "application/json; charset=utf-8",
+        "Application/JSON; Charset=UTF-8",
+        ' application/json ; profile="urn:example;v=1" ',
+        "application/vnd.example+json; charset=utf-8",
+    ],
+)
+def test_litestar_union_request_adapter_rejects_unknowns_before_application_invocation(media_type: str) -> None:
     from litestar import Litestar, post
     from litestar.testing import TestClient
 
@@ -407,15 +417,14 @@ def test_litestar_union_request_adapter_rejects_unknowns_before_application_invo
     @post("/items")
     async def update(request: Any) -> dict[str, bool]:
         nonlocal calls
-        await request_model(adapter, request, "application/json")
+        await request_model(adapter, request, request.headers["content-type"])
         calls += 1
         return {"accepted": True}
 
     with TestClient(Litestar([update], plugins=[SundayPlugin()])) as client:
+        client.headers["content-type"] = media_type
         assert client.post("/items", json={"state": "future"}).status_code == 400
-        assert (
-            client.post("/items", content="{invalid", headers={"content-type": "application/json"}).status_code == 400
-        )
+        assert client.post("/items", content="{invalid").status_code == 400
         assert calls == 0
         assert client.post("/items", json={"state": "active"}).status_code == 201
         assert client.post("/items", json={"other": 1}).status_code == 201
