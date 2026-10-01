@@ -22,6 +22,7 @@ from ..media import MediaType
 from ..specs import RequestSpec
 from ..sse import EventParser, EventStreamOptions, ServerSentEvent
 from ._reconnect import _ReconnectPolicy
+from ._security import AuthenticationRecoveryBudget
 
 if TYPE_CHECKING:
     from ._transport import HttpxEventSourceRequestFactory, HttpxTransport
@@ -105,6 +106,7 @@ class HttpxEventStream[EventT]:
         self._close_event = anyio.Event()
         reconnect = _ReconnectPolicy(self._options.retry, self._options.retry_max)
         last_event_id: str | None = None
+        recovery_budget = AuthenticationRecoveryBudget()
 
         try:
             with anyio.CancelScope() as cancel_scope:
@@ -123,7 +125,7 @@ class HttpxEventStream[EventT]:
                             request = await request_value if inspect.isawaitable(request_value) else request_value
                         request = await self._transport._adapt_request(request)
                         self._disable_httpx_read_timeout(request)
-                        response = await self._transport._send_event_stream(request)
+                        response = await self._transport._send_event_stream(request, recovery_budget=recovery_budget)
                         self._response = response
 
                         if response.status_code == 204:

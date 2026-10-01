@@ -9,6 +9,7 @@ Install ``sunday-python[httpx]`` before importing this module.
 """
 
 try:
+    from ._oauth import AuthorizationGrant, HttpxOAuthTokenProvider
     from ._transport import (
         HttpxEventSource,
         HttpxEventSourceRequestFactory,
@@ -23,9 +24,11 @@ except ModuleNotFoundError as error:
     raise ImportError("sunday.httpx requires the 'httpx' extra; install 'sunday-python[httpx]'") from error
 
 __all__ = [
+    "AuthorizationGrant",
     "HttpxEventSource",
     "HttpxEventSourceRequestFactory",
     "HttpxEventStream",
+    "HttpxOAuthTokenProvider",
     "HttpxRequestAdapter",
     "HttpxRequestAdapterCallable",
     "HttpxTransport",

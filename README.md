@@ -97,6 +97,63 @@ Generated clients expose their `transport`, `default_content_types`, and `defaul
 declarations take precedence when they cannot use the client defaults, and an explicit Content-Type header remains
 authoritative.
 
+## Profiled credentials
+
+Generated operations carry selected `SecurityBinding` metadata in `RequestSpec.security`. Applications
+register providers on a shared `TokenManager` and pass it to `HttpxTransport(token_manager=...)`.
+Providers and token storage stay in the application; generated code contains no credentials.
+
+```python
+import httpx
+from sunday import TokenManager
+from sunday.httpx import HttpxOAuthTokenProvider, HttpxTransport
+
+
+def create_transport(client: httpx.AsyncClient, client_secret: str) -> HttpxTransport:
+    # The caller owns and closes the borrowed client.
+    provider = HttpxOAuthTokenProvider(
+        client,
+        identity="service-credential-v1",
+        client_id="service-client",
+        client_secret=client_secret,
+        authentication="client_secret_basic",
+    )
+    return HttpxTransport(
+        client,
+        token_manager=TokenManager({"service-identity": provider}),
+    )
+```
+
+For an interactive public client, use `authentication="none"`, a fresh `grant_identity`, and an async
+`authorization(request)` callback returning `AuthorizationGrant(code, redirect_uri, code_verifier)`.
+The application performs the browser flow using S256 PKCE and verifies state, issuer, and redirect URI
+before supplying the result. A code is consumed once, even if exchange fails or is canceled. An expired
+session without refresh capability, or an invalid interactive refresh grant, raises
+`AuthorizationRequiredError`; supply fresh application authorization with a new grant identity.
+Discovery requires the separately configured `issuer`. Acquisition `endpoints` overrides do not change it.
+Token exchanges support `client_secret_basic`, `client_secret_post`, and public-client `none` authentication;
+other methods use an application `TokenProvider`. HTTPS is required except for loopback development URLs.
+
+Custom `TokenProvider` implementations supply external or static credentials through `configure` and
+`acquire`; implementing `refresh` adds optional refresh capability. `TokenSet.expires_at` is Unix seconds.
+Return a new `refresh_token` when it rotates; omitting it retains the previous token. Provider exceptions
+become safe `TokenProviderError` diagnostics. Cancellation still propagates normally.
+
+Cache keys include provider/client identity, grant identity, profile, flow, resolved endpoints, scopes,
+audience, and resource. Change provider identity when credential configuration changes, and grant identity
+when session or grant inputs change. Share one manager on one asyncio event loop across generated clients;
+its optional `TokenStore` supports application-owned storage. The manager coalesces renewal and defaults to
+30 seconds of expiry skew. Canceling one waiter preserves other waiters; canceling the last cancels
+acquisition, while a completed refresh is saved to preserve rotation.
+
+HTTPX attaches every credential in the selected AND alternative before sending. Missing providers or
+conflicting credentials fail before network access. It checks credentials on every execution, including
+reused native requests. A bodyless GET/HEAD/OPTIONS receiving `401` with a bearer `invalid_token` challenge
+may renew and replay once; POST, streamed bodies, and `403` never trigger automatic replay. Managed
+credential requests do not follow redirects or apply HTTPX client-level auth. Managed query/header/cookie
+credentials are redacted from Sunday observers and response/error request diagnostics. Plain request
+adapters retain their existing behavior when no managed binding is selected.
+
 ## Errors
 
 Sunday-originated failures are grouped as `RequestEncodingError`, `ResponseDecodingError`, `ResponseValidationError`, and
@@ -115,6 +172,19 @@ and YAML extras. Their deterministic preference order is JSON, CBOR, XML, YAML, 
 Passing a custom encoder or decoder registry is authoritative and disables this automatic composition. Request content
 negotiation honors an explicit `Content-Type`; otherwise it selects the first declared installed encoder. Generated
 `Accept` values include only installed decoders.
+
+## Model validation
+
+Generated models use Pydantic's native validation API. Select the payload mode with
+`Item.model_validate(item, strict=True, context={"mode": ModelMode.REQUEST})`, or an equivalent
+`TypeAdapter` call. Response mode permits declared tolerant fallbacks; request mode rejects them unless
+the schema explicitly allows them. Constructors use response semantics.
+
+`SundayModel` rechecks current instance values, including mutations, without changing the application
+model, its extras, or its field-presence set. An ambiguous extra key that would overwrite a field or be
+promoted into an omitted field during revalidation produces `model_key_conflict` at its original path.
+Normal alias/name input selection remains Pydantic behavior. Litestar's `SundayPlugin` selects request
+mode before invoking application handlers; Sunday transports check every execution before encoding.
 
 ## Server-sent events
 

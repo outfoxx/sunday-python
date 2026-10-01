@@ -9,6 +9,7 @@ from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mappin
 from time import monotonic
 from types import TracebackType
 from typing import Any, Protocol, TypeVar
+from weakref import WeakKeyDictionary
 
 import anyio
 import httpx
@@ -30,8 +31,10 @@ from ..problems import Problem, ProblemRegistry
 from ..specs import RequestSpec, ResponseSpec
 from ..sse import EventStreamOptions, ServerSentEvent
 from ..streaming import StreamingBody
+from ..token_manager import TokenManager
 from ..transport import BaseTransport
 from ..uri import URITemplate
+from ._security import AuthenticationRecoveryBudget, RequestSecurity
 
 ResponseT = TypeVar("ResponseT")
 
@@ -69,6 +72,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         adapters: Sequence[HttpxRequestAdapter | HttpxRequestAdapterCallable] = (),
         observers: Sequence[TransportObserver] = (),
         sensitive_headers: Sequence[str] = (),
+        token_manager: TokenManager | None = None,
     ) -> None:
         if client is not None and base_url is not None:
             raise TransportError("base_url cannot be provided with a borrowed HTTPX client")
@@ -80,6 +84,8 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         self.adapters = tuple(adapters)
         self.observers = tuple(observers)
         self.sensitive_headers = tuple(sensitive_headers)
+        self.token_manager = token_manager
+        self._request_security: WeakKeyDictionary[httpx.Request, RequestSecurity] = WeakKeyDictionary()
         self._closed = False
         self._event_sources: set[HttpxEventSource] = set()
 
@@ -100,9 +106,14 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                 "Request encoding failed",
                 details={"method": spec.method, "path_template": str(spec.path_template)},
             ) from error
-        return await self._adapt_request(request)
+        adapted = await self._adapt_request(request)
+        if adapted is not request and request in self._request_security:
+            self._request_security[adapted] = self._request_security[request]
+        await self._authorize_request(adapted)
+        return adapted
 
     def _build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
+        spec.validate_body()
         parameters = encode_parameters(spec.parameters)
         if isinstance(spec.path_template, URITemplate):
             template = spec.path_template.template
@@ -202,7 +213,10 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             if "content-type" not in headers:
                 headers["content-type"] = str(content_type)
 
-        return self.client.build_request(spec.method.upper(), path, headers=headers, content=content)
+        request = self.client.build_request(spec.method.upper(), path, headers=headers, content=content)
+        if spec.security is not None:
+            self._request_security[request] = RequestSecurity(spec.security)
+        return request
 
     def _header_media_type(self, headers: httpx.Headers, name: str) -> MediaType | None:
         value = headers.get(name)
@@ -246,15 +260,50 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             adapt = getattr(adapter, "adapt", None)
             adapted = await adapt(self, request) if adapt is not None else await adapter(self, request)  # type: ignore[operator]
             if adapted is not None:
+                if adapted is not request and request in self._request_security:
+                    self._request_security[adapted] = self._request_security[request]
                 request = adapted
         return request
 
+    async def _authorize_request(self, request: httpx.Request) -> RequestSecurity | None:
+        security = self._request_security.get(request)
+        if security is not None:
+            security = await security.authorize(request, self.token_manager)
+            self._request_security[request] = security
+        return security
+
     async def _send(self, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
         """Send a native HTTPX request."""
-        return await self._send_httpx(request, stream=stream)
+        return await self._send_authorized(request, stream=stream)
 
-    async def _send_event_stream(self, request: httpx.Request) -> httpx.Response:
-        return await self._send_httpx(request, stream=True, follow_redirects=True)
+    async def _send_event_stream(
+        self, request: httpx.Request, *, recovery_budget: AuthenticationRecoveryBudget
+    ) -> httpx.Response:
+        return await self._send_authorized(request, stream=True, follow_redirects=True, recovery_budget=recovery_budget)
+
+    async def _send_authorized(
+        self,
+        request: httpx.Request,
+        *,
+        stream: bool,
+        follow_redirects: bool | None = None,
+        recovery_budget: AuthenticationRecoveryBudget | None = None,
+    ) -> httpx.Response:
+        budget = recovery_budget or AuthenticationRecoveryBudget()
+        security = await self._authorize_request(request)
+        # This is the sole owner of authentication replay for one transport invocation.
+        response = await self._send_httpx(request, stream=stream, follow_redirects=follow_redirects)
+        rejected = security.rejected_leases(request, response) if security is not None else ()
+        if rejected and self.token_manager is not None and budget.consume():
+            with anyio.CancelScope(shield=True):
+                await response.aclose()
+            for lease in rejected:
+                await self.token_manager.invalidate(lease)
+            await self._authorize_request(request)
+            response = await self._send_httpx(request, stream=stream, follow_redirects=follow_redirects)
+        if security is not None and security.bindings:
+            response.request = security.diagnostic_request(request)
+        return response
 
     async def _send_httpx(
         self,
@@ -266,36 +315,44 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         if self._closed:
             raise TransportError("HttpxTransport is closed")
         started = monotonic()
+        security = self._request_security.get(request)
+        diagnostic = security.diagnostic_request(request) if security is not None and security.bindings else request
         self._observe(
             TransportEvent(
                 TransportEventKind.REQUEST,
                 request.method,
-                str(request.url),
-                redact_headers(request.headers.multi_items(), self.sensitive_headers),
+                str(diagnostic.url),
+                redact_headers(diagnostic.headers.multi_items(), self.sensitive_headers),
             )
         )
         try:
-            if follow_redirects is None:
+            if security is not None and security.bindings:
+                # HTTPX only strips standard Authorization on cross-origin redirects. Managed API keys
+                # must not follow redirects or allow native auth to overwrite a selected alternative.
+                response = await self.client.send(request, stream=stream, follow_redirects=False, auth=None)
+            elif follow_redirects is None:
                 response = await self.client.send(request, stream=stream)
             else:
                 response = await self.client.send(request, stream=stream, follow_redirects=follow_redirects)
         except BaseException as error:
+            if diagnostic is not request and isinstance(error, httpx.RequestError):
+                error = type(error)("HTTP request failed", request=diagnostic)
             self._observe(
                 TransportEvent(
                     TransportEventKind.FAILURE,
                     request.method,
-                    str(request.url),
+                    str(diagnostic.url),
                     (),
                     elapsed=monotonic() - started,
                     error=error,
                 )
             )
-            raise
+            raise error from None
         self._observe(
             TransportEvent(
                 TransportEventKind.RESPONSE,
                 request.method,
-                str(request.url),
+                str(diagnostic.url),
                 redact_headers(response.headers.multi_items(), self.sensitive_headers),
                 status=response.status_code,
                 elapsed=monotonic() - started,

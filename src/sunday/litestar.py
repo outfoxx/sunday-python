@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from enum import Enum
@@ -14,13 +14,15 @@ from typing import Any
 
 from litestar import Request
 from litestar.config.app import AppConfig
-from litestar.exceptions import HTTPException
-from litestar.plugins.pydantic import PydanticPlugin
+from litestar.exceptions import HTTPException, ValidationException
+from litestar.plugins.pydantic import PydanticDIPlugin, PydanticInitPlugin, PydanticPlugin, PydanticSchemaPlugin
 from litestar.response import Response
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .media import MediaType
+from .models import SundayModel
 from .problems import Problem
+from .unknown_model import UnknownModel
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,9 +73,49 @@ class SundayPlugin(PydanticPlugin):
 
     def on_app_init(self, app_config: AppConfig) -> AppConfig:
         """Apply Sunday server integration to a Litestar application."""
-        app_config = super().on_app_init(app_config)
+        app_config.plugins.extend(
+            [
+                _SundayPydanticInitPlugin(prefer_alias=True),
+                PydanticSchemaPlugin(prefer_alias=True),
+                PydanticDIPlugin(),
+            ]
+        )
         app_config.exception_handlers[Problem] = problem_exception_handler
         return app_config
+
+
+class _SundayPydanticInitPlugin(PydanticInitPlugin):
+    @classmethod
+    def decoders(cls, validate_strict: bool = False) -> list[tuple[Callable[[Any], bool], Callable[[Any, Any], Any]]]:
+        def is_sunday_model(model_type: Any) -> bool:
+            return isinstance(model_type, type) and issubclass(model_type, (SundayModel, UnknownModel))
+
+        return [(is_sunday_model, _decode_request_model), *super().decoders(validate_strict)]
+
+    def on_app_init(self, app_config: AppConfig) -> AppConfig:
+        app_config = super().on_app_init(app_config)
+        assert app_config.type_encoders is not None
+        encode = app_config.type_encoders[BaseModel]
+
+        def encode_response(value: BaseModel) -> Any:
+            type(value).model_validate(value, strict=True, context={"mode": "response"})
+            return encode(value)
+
+        app_config.type_encoders = {
+            **app_config.type_encoders,
+            SundayModel: encode_response,
+            UnknownModel: encode_response,
+        }
+        return app_config
+
+
+def _decode_request_model(model_type: type[BaseModel], value: Any) -> BaseModel:
+    try:
+        return model_type.model_validate(value, context={"mode": "request"})
+    except ValidationError as error:
+        raise ValidationException(
+            detail="Request entity is invalid", extra=error.errors(include_input=False)
+        ) from error
 
 
 def problem_exception_handler(_request: Request[Any, Any, Any], exc: Problem) -> Response[dict[str, Any]]:
@@ -135,7 +177,12 @@ async def request_model[ModelT](
         value = YamlCodec().decode(body, MediaType(media_type))
     else:
         raise ValueError(f"Sunday request_model does not support {media_type}")
-    return TypeAdapter(model_type).validate_python(value)
+    try:
+        return TypeAdapter(model_type).validate_python(value, context={"mode": "request"})
+    except ValidationError as error:
+        raise ValidationException(
+            detail="Request entity is invalid", extra=error.errors(include_input=False)
+        ) from error
 
 
 async def server_sent_events(events: AsyncIterable[BaseModel | str | bytes]) -> AsyncIterator[str]:
