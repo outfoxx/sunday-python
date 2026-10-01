@@ -76,7 +76,6 @@ class HttpxOAuthTokenProvider:
         self._issuer = issuer
         self._now = now
         self._consumed_codes: set[bytes] = set()
-        self._discovery: dict[str, dict[str, object]] = {}
 
     def configure(self, _binding: SecurityBinding) -> TokenConfiguration:
         """Select the application client and session without changing the generated profile."""
@@ -91,7 +90,7 @@ class HttpxOAuthTokenProvider:
                     raise TokenProviderError()
                 form = {"grant_type": "client_credentials"}
             elif request.flow == "authorizationCode":
-                if self._authorization is None:
+                if self._authorization is None or len(self._consumed_codes) >= 1024:
                     raise AuthorizationRequiredError()
                 grant = await self._authorization(request)
                 if (
@@ -101,7 +100,7 @@ class HttpxOAuthTokenProvider:
                 ):
                     raise AuthorizationRequiredError()
                 code_key = hashlib.sha256(grant.code.encode()).digest()
-                if code_key in self._consumed_codes:
+                if len(self._consumed_codes) >= 1024 or code_key in self._consumed_codes:
                     raise AuthorizationRequiredError()
                 self._consumed_codes.add(code_key)
                 form = {
@@ -113,8 +112,10 @@ class HttpxOAuthTokenProvider:
             else:
                 raise TokenProviderError()
             return await self._exchange(request, request.token_url, form)
-        except AuthorizationRequiredError:
+        except (AuthorizationRequiredError, TokenProviderError):
             raise
+        except httpx.TransportError:
+            raise TokenProviderError("temporary") from None
         except Exception:
             raise TokenProviderError() from None
 
@@ -127,8 +128,10 @@ class HttpxOAuthTokenProvider:
                 request.refresh_url or request.token_url,
                 {"grant_type": "refresh_token", "refresh_token": refresh_token},
             )
-        except AuthorizationRequiredError:
+        except (AuthorizationRequiredError, TokenProviderError):
             raise
+        except httpx.TransportError:
+            raise TokenProviderError("temporary") from None
         except Exception:
             raise TokenProviderError() from None
 
@@ -137,21 +140,18 @@ class HttpxOAuthTokenProvider:
             return request
         if not self._issuer:
             raise TokenProviderError()
-        document = self._discovery.get(request.discovery_url)
-        if document is None:
-            response = await self._client.send(
-                httpx.Request("GET", _endpoint(request.discovery_url), headers={"Accept": "application/json"}),
-                auth=None,
-                follow_redirects=False,
-            )
-            data = response.json()
-            if response.status_code != 200 or not isinstance(data, dict) or data.get("issuer") != self._issuer:
-                raise TokenProviderError()
-            document = data
-            methods = document.get("token_endpoint_auth_methods_supported", ["client_secret_basic"])
-            if not isinstance(methods, list) or self._authentication not in methods:
-                raise TokenProviderError()
-            self._discovery[request.discovery_url] = document
+        response = await self._client.send(
+            httpx.Request("GET", _endpoint(request.discovery_url), headers={"Accept": "application/json"}),
+            auth=None,
+            follow_redirects=False,
+        )
+        _check_availability(response.status_code)
+        document = response.json()
+        if response.status_code != 200 or not isinstance(document, dict) or document.get("issuer") != self._issuer:
+            raise TokenProviderError()
+        methods = document.get("token_endpoint_auth_methods_supported", ["client_secret_basic"])
+        if not isinstance(methods, list) or self._authentication not in methods:
+            raise TokenProviderError()
         token_url = request.token_url or document.get("token_endpoint")
         authorization_url = request.authorization_url or document.get("authorization_endpoint")
         if not isinstance(token_url, str) or (authorization_url is not None and not isinstance(authorization_url, str)):
@@ -177,12 +177,17 @@ class HttpxOAuthTokenProvider:
             auth=auth,
             follow_redirects=False,
         )
+        _check_availability(response.status_code)
         data = response.json()
         if not isinstance(data, dict):
             raise TokenProviderError()
         if response.status_code != 200:
-            if data.get("error") == "invalid_grant" and request.flow == "authorizationCode":
-                raise AuthorizationRequiredError()
+            if data.get("error") == "invalid_grant":
+                if request.flow == "authorizationCode":
+                    raise AuthorizationRequiredError()
+                raise TokenProviderError("invalid_grant")
+            if data.get("error") in ("temporarily_unavailable", "server_error"):
+                raise TokenProviderError("temporary")
             raise TokenProviderError()
         access_token, token_type = data.get("access_token"), data.get("token_type")
         if (
@@ -207,6 +212,11 @@ class HttpxOAuthTokenProvider:
         if scope is not None and (not isinstance(scope, str) or not set(request.scopes).issubset(scope.split())):
             raise TokenProviderError()
         return TokenSet(access_token, expires_at, refresh_token)
+
+
+def _check_availability(status: int) -> None:
+    if status in (408, 429) or 500 <= status <= 599:
+        raise TokenProviderError("temporary")
 
 
 def _endpoint(value: str | None) -> httpx.URL:

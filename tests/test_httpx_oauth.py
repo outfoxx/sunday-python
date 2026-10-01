@@ -5,6 +5,7 @@
 
 import base64
 from dataclasses import replace
+from typing import Literal
 from urllib.parse import parse_qs
 
 import httpx
@@ -17,6 +18,7 @@ from sunday import (
     SecurityTransport,
     TokenManager,
     TokenProviderError,
+    TokenRequest,
 )
 from sunday.httpx import AuthorizationGrant, HttpxOAuthTokenProvider
 
@@ -35,7 +37,9 @@ BINDING = SecurityBinding(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("authentication", ["client_secret_basic", "client_secret_post"])
-async def test_client_credentials_and_rotating_refresh(authentication: str) -> None:
+async def test_client_credentials_and_rotating_refresh(
+    authentication: Literal["client_secret_basic", "client_secret_post"],
+) -> None:
     exchanges = []
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -93,7 +97,7 @@ async def test_client_credentials_and_rotating_refresh(authentication: str) -> N
 async def test_pkce_consumes_authorization_once_and_invalid_refresh_requires_new_session() -> None:
     grants, exchanges = [], []
 
-    async def authorize(request):
+    async def authorize(request: TokenRequest) -> AuthorizationGrant:
         grants.append(request)
         return AuthorizationGrant("fresh-code", "https://app.example/callback", "v" * 43)
 
@@ -173,6 +177,7 @@ async def test_discovery_validates_issuer_and_endpoint_overrides_do_not_change_i
         assert seen == [
             "https://metadata.example/document",
             "https://deployment.example/token",
+            "https://metadata.example/document",
             "https://deployment.example/token",
         ]
         wrong = HttpxOAuthTokenProvider(
@@ -243,3 +248,50 @@ async def test_public_client_credentials_and_unsafe_endpoints_fail_before_exchan
             with pytest.raises(TokenProviderError):
                 await TokenManager({"identity": provider}).credentials(replace(BINDING, token_url=endpoint))
     assert calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "status,body,reason",
+    [
+        (503, "SECRET outage", "temporary"),
+        (429, "SECRET rate limit", "temporary"),
+        (400, '{"error":"temporarily_unavailable"}', "temporary"),
+        (400, '{"error":"invalid_grant"}', "invalid_grant"),
+        (400, '{"error":"invalid_client"}', "unavailable"),
+    ],
+)
+async def test_token_error_classification(status: int, body: str, reason: str) -> None:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(status, text=body))) as client:
+        provider = HttpxOAuthTokenProvider(
+            client, identity="app", client_id="client", client_secret="secret", authentication="client_secret_post"
+        )
+        with pytest.raises(TokenProviderError) as error:
+            await TokenManager({"identity": provider}).credentials(BINDING)
+        assert error.value.reason == reason
+        assert "SECRET" not in str(error.value)
+
+
+@pytest.mark.anyio
+async def test_consumed_authorization_history_is_bounded_without_reusing_codes() -> None:
+    grants = 0
+
+    async def authorize(_: TokenRequest) -> AuthorizationGrant:
+        nonlocal grants
+        grants += 1
+        return AuthorizationGrant(f"code-{grants}", "https://app.example/callback", "v" * 43)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json={"access_token": "token", "token_type": "bearer"})
+        )
+    ) as client:
+        provider = HttpxOAuthTokenProvider(
+            client, identity="app", client_id="public", grant_identity="session", authorization=authorize
+        )
+        manager = TokenManager({"identity": provider})
+        for index in range(1024):
+            await manager.credentials(replace(BINDING, flow="authorizationCode", scopes=(str(index),)))
+        with pytest.raises(AuthorizationRequiredError):
+            await manager.credentials(replace(BINDING, flow="authorizationCode", scopes=("next",)))
+    assert grants == 1024

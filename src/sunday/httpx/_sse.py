@@ -21,6 +21,7 @@ from ..event_source import EventSourceErrorHandler, EventSourceMessageHandler, E
 from ..media import MediaType
 from ..specs import RequestSpec
 from ..sse import EventParser, EventStreamOptions, ServerSentEvent
+from ..token_provider import TokenProviderError
 from ._reconnect import _ReconnectPolicy
 from ._security import AuthenticationRecoveryBudget
 
@@ -168,7 +169,9 @@ class HttpxEventStream[EventT]:
                                 decoded = self._decoder(event)
                                 if decoded is not None:
                                     yield decoded
-                    except (httpx.TransportError, TimeoutError) as error:
+                    except (httpx.TransportError, TimeoutError, TokenProviderError) as error:
+                        if isinstance(error, TokenProviderError) and error.reason != "temporary":
+                            raise
                         if self._closed:
                             return
                         if self._on_error is not None:

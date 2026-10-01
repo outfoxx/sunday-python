@@ -154,6 +154,14 @@ credential requests do not follow redirects or apply HTTPX client-level auth. Ma
 credentials are redacted from Sunday observers and response/error request diagnostics. Plain request
 adapters retain their existing behavior when no managed binding is selected.
 
+Credentials are isolated by logical security scheme as well as provider and acquisition inputs.
+Discovery metadata is fetched and verified on each acquisition or renewal. Temporary provider outages
+allow event connections to reconnect; a rejected refresh grant triggers fresh client credentials only
+for the client-credentials flow. Interactive sessions require fresh application authorization.
+Built-in OAuth providers retain at most 1,024 consumed authorization-code hashes per provider instance.
+After this limit, create a provider for a newly authorized application session; old hashes are never
+evicted to allow code reuse. Refresh exchanges do not consume this history.
+
 ## Errors
 
 Sunday-originated failures are grouped as `RequestEncodingError`, `ResponseDecodingError`, `ResponseValidationError`, and
@@ -222,3 +230,5 @@ mise run check
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the validation and release rules.
 The [parity matrix](docs/parity.md) records the generator IR boundary and intentional exclusions for the first beta.
 The [beta migration guide](docs/migration.md) covers the breaking transport, client, ownership, and error changes.
+
+Model revalidation requires Pydantic 2.13 or newer, including native dictionary-subclass alias lookup and field-presence handling.

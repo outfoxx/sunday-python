@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 from pydantic import ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
@@ -205,7 +207,7 @@ def test_existing_instance_name_selection_preserves_presence_and_native_validati
     assert (original.model_dump(), original.model_fields_set) == before
     original.project_id = "valid"
     if extra == "allow":
-        original.note = "extra"
+        cast(Any, original).note = "extra"
     validated = adapter.validate_python(original, strict=True, by_alias=use_alias, by_name=not use_alias)
     assert validated.project_id == "valid"
     assert validated.model_fields_set == original.model_fields_set
@@ -266,7 +268,7 @@ def test_ambiguous_extra_revalidation_never_discards_a_value(initial_alias: bool
 
     selected, ignored = ("projectId", "project_id") if initial_alias else ("project_id", "projectId")
     original = Named.model_validate({selected: "field", ignored: 7}, by_alias=initial_alias, by_name=not initial_alias)
-    before = original.__dict__.copy(), original.model_fields_set.copy(), dict(original.__pydantic_extra__)
+    before = original.__dict__.copy(), original.model_fields_set.copy(), dict(original.__pydantic_extra__ or {})
     checks.clear()
     models.clear()
     if initial_alias and use_alias:
@@ -297,7 +299,7 @@ def test_extra_cannot_be_promoted_into_an_omitted_field_during_revalidation(use_
         project_id: str | None = Field(default=None, alias="projectId")
 
     original = OptionalNamed.model_validate({"projectId": "extra"}, by_alias=False, by_name=True)
-    before = original.__dict__.copy(), original.model_fields_set.copy(), dict(original.__pydantic_extra__)
+    before = original.__dict__.copy(), original.model_fields_set.copy(), dict(original.__pydantic_extra__ or {})
     assert original.project_id is None
     with pytest.raises(ValidationError) as error:
         OptionalNamed.model_validate(original, by_alias=use_alias, by_name=not use_alias)

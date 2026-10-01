@@ -6,7 +6,7 @@
 """Application credential acquisition and storage contracts."""
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Literal, Protocol
 
 from .security import SecurityBinding, SecurityEndpoints
 
@@ -88,5 +88,6 @@ class AuthorizationRequiredError(Exception):
 class TokenProviderError(Exception):
     """Safe provider failure that does not expose credential-bearing provider messages."""
 
-    def __init__(self) -> None:
+    def __init__(self, reason: Literal["unavailable", "temporary", "invalid_grant"] = "unavailable") -> None:
+        self.reason = reason
         super().__init__("The credential provider could not supply usable credentials")

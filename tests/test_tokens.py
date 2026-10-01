@@ -5,6 +5,7 @@
 
 import asyncio
 from dataclasses import replace
+from typing import Literal, cast
 
 import pytest
 
@@ -119,6 +120,7 @@ async def test_cache_key_includes_every_acquisition_dimension() -> None:
     first = await manager.credentials(BINDING)
     assert await manager.credentials(replace(BINDING, scopes=("write", "read", "read"))) == first
     for binding in (
+        replace(BINDING, scheme="another-scheme"),
         replace(BINDING, profile="internal"),
         replace(BINDING, scopes=("read",)),
         replace(BINDING, audience="other"),
@@ -141,7 +143,7 @@ async def test_cache_key_includes_every_acquisition_dimension() -> None:
     assert provider.acquisitions[-1].profile == "external"
     provider.identity = "other-provider"
     assert (await manager.credentials(BINDING)).key != first.key
-    assert len(provider.acquisitions) == 15
+    assert len(provider.acquisitions) == 16
 
 
 @pytest.mark.anyio
@@ -257,3 +259,55 @@ async def test_missing_provider_invalid_tokens_and_session_fail_before_use() -> 
     provider.configuration = TokenConfiguration("client")
     with pytest.raises(TokenProviderError):
         await TokenManager({"identity": provider}).credentials(replace(BINDING, flow="authorizationCode"))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reason", ["unavailable", "temporary", "invalid_grant"])
+async def test_only_rejected_client_refresh_grants_reacquire(reason: str) -> None:
+    class RejectedProvider(Provider):
+        async def refresh(self, request: TokenRequest, refresh_token: str) -> TokenSet:
+            self.refreshes.append(refresh_token)
+            raise TokenProviderError(cast(Literal["unavailable", "temporary", "invalid_grant"], reason))
+
+    provider = RejectedProvider()
+    manager = TokenManager({"identity": provider}, now=lambda: 0)
+    await manager.invalidate(await manager.credentials(BINDING))
+    provider.tokens = TokenSet("replacement", 200)
+    if reason == "invalid_grant":
+        assert (await manager.credentials(BINDING)).tokens.access_token == "replacement"
+        assert len(provider.acquisitions) == 2
+    else:
+        with pytest.raises(TokenProviderError) as error:
+            await manager.credentials(BINDING)
+        assert error.value.reason == reason
+        assert len(provider.acquisitions) == 1
+
+
+@pytest.mark.anyio
+async def test_provider_ignoring_cancellation_cannot_persist_late_acquisition() -> None:
+    started, canceled, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class IgnoringProvider(Provider):
+        async def acquire(self, request: TokenRequest) -> TokenSet:
+            self.acquisitions.append(request)
+            if len(self.acquisitions) == 1:
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    canceled.set()
+                await finish.wait()
+                return TokenSet("late")
+            return TokenSet("fresh")
+
+    provider = IgnoringProvider()
+    manager = TokenManager({"identity": provider})
+    caller = asyncio.create_task(manager.credentials(BINDING))
+    await started.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await canceled.wait()
+    finish.set()
+    assert (await manager.credentials(BINDING)).tokens.access_token == "fresh"
+    assert len(provider.acquisitions) == 2

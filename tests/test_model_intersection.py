@@ -22,7 +22,7 @@ def test_native_intersection_retains_payload_type_aliases_and_presence_without_c
         count: Annotated[int, Field(le=9, alias="wire-count")]
         note: str | None = None
 
-    adapter = TypeAdapter(Annotated[Payload, ModelIntersection(Rules)])
+    adapter: TypeAdapter[Payload] = TypeAdapter(Annotated[Payload, ModelIntersection(Rules)])
     payload = Payload(count=2)
     checked = adapter.validate_python(payload, strict=True)
     assert type(checked) is Payload
@@ -54,7 +54,7 @@ def test_intersection_uses_native_field_callbacks_once() -> None:
     class Payload(SundayModel):
         text: str
 
-    adapter = TypeAdapter(Annotated[Payload, ModelIntersection(Rules)])
+    adapter: TypeAdapter[Payload] = TypeAdapter(Annotated[Payload, ModelIntersection(Rules)])
     checked = adapter.validate_python({"text": "first"})
     checked.text = "second"
     adapter.validate_python(checked)

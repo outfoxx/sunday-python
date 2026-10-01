@@ -292,3 +292,35 @@ async def test_event_reconnects_share_one_authentication_recovery() -> None:
     assert values == ["first"]
     assert authorization == ["Bearer access-1", "Bearer renewed-1", "Bearer renewed-1"]
     assert provider.refreshes == ["refresh-first"]
+
+
+@pytest.mark.anyio
+async def test_event_reconnects_after_temporary_token_outage() -> None:
+    from sunday import EventStreamOptions, TokenProviderError
+
+    class IntermittentProvider(Provider):
+        async def acquire(self, request: TokenRequest) -> TokenSet:
+            if self.acquisitions == 0:
+                self.acquisitions += 1
+                raise TokenProviderError("temporary")
+            return await super().acquire(request)
+
+    provider = IntermittentProvider()
+    async with httpx.AsyncClient(
+        base_url="https://api.example",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content="data: recovered\n\n")
+        ),
+    ) as client:
+        transport = HttpxTransport(client, token_manager=TokenManager({"identity": provider}))
+        stream = transport.event_stream(
+            RequestSpec("GET", "/events", security=(BINDING,)),
+            lambda event: event.data,
+            options=EventStreamOptions(retry=0),
+        )
+        values = []
+        async for value in stream:
+            values.append(value)
+            await stream.aclose()
+        assert values == ["recovered"]
+    assert provider.acquisitions == 2

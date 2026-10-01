@@ -122,6 +122,7 @@ class TokenManager:
             )
             key = json.dumps(
                 [
+                    request.scheme,
                     binding.provider,
                     provider.identity,
                     request.client_identity,
@@ -161,9 +162,16 @@ class TokenManager:
                 if stored is not None and (stored.expires_at is None or stored.expires_at > self._now() + self._skew):
                     return TokenLease(key, stored)
                 if stored is not None and stored.refresh_token and callable(getattr(provider, "refresh", None)):
-                    tokens = await cast(RefreshingTokenProvider, provider).refresh(request, stored.refresh_token)
-                    if tokens.refresh_token is None:
-                        tokens = replace(tokens, refresh_token=stored.refresh_token)
+                    try:
+                        tokens = await cast(RefreshingTokenProvider, provider).refresh(request, stored.refresh_token)
+                        if tokens.refresh_token is None:
+                            tokens = replace(tokens, refresh_token=stored.refresh_token)
+                    except TokenProviderError as error:
+                        if error.reason != "invalid_grant" or request.flow != "clientCredentials":
+                            raise
+                        await asyncio.sleep(0)
+                        await self._store.remove(key)
+                        tokens = await provider.acquire(request)
                 elif request.flow == "authorizationCode" and (
                     stored is not None or key in self._authorization_attempts
                 ):
@@ -177,12 +185,20 @@ class TokenManager:
                     and (not math.isfinite(tokens.expires_at) or tokens.expires_at <= self._now())
                 ):
                     raise TokenProviderError()
+                task = asyncio.current_task()
                 renewal = self._renewals.get(key)
-                if renewal is not None and renewal.task is asyncio.current_task():
-                    renewal.committing = True
+                if (
+                    task is None
+                    or task.cancelling()
+                    or renewal is None
+                    or renewal.task is not task
+                    or not renewal.waiters
+                ):
+                    raise asyncio.CancelledError
+                renewal.committing = True
                 await self._store.save(key, tokens)
                 return TokenLease(key, tokens)
-        except AuthorizationRequiredError:
+        except (AuthorizationRequiredError, TokenProviderError):
             raise
         except Exception:
             raise TokenProviderError() from None
