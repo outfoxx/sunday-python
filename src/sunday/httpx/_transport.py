@@ -109,7 +109,6 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         adapted = await self._adapt_request(request)
         if adapted is not request and request in self._request_security:
             self._request_security[adapted] = self._request_security[request]
-        await self._authorize_request(adapted)
         return adapted
 
     def _build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
@@ -215,6 +214,9 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
 
         request = self.client.build_request(spec.method.upper(), path, headers=headers, content=content)
         if spec.security is not None:
+            if spec.security and "authorization" not in headers:
+                # A borrowed client's default credentials are not part of the selected alternative.
+                request.headers.pop("authorization", None)
             self._request_security[request] = RequestSecurity(spec.security)
         return request
 

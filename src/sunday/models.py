@@ -56,7 +56,7 @@ class _ModelFieldView(dict[str, Any]):
         self._fields: dict[str, str] = {}
         self._keys: dict[str, str] = {}
         for name, field in type(value).model_fields.items():
-            alias = field.alias or name
+            alias = field.validation_alias if isinstance(field.validation_alias, str) else field.alias or name
             self._fields[name] = name
             self._fields[alias] = name
             self._keys[name] = alias

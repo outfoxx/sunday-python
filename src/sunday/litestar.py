@@ -161,12 +161,20 @@ async def request_bytes(request: Request[Any, Any, Any], media_types: Sequence[s
 
 
 async def request_model[ModelT](
-    model_type: type[ModelT],
+    model_type: type[ModelT] | TypeAdapter[ModelT],
     request: Request[Any, Any, Any],
     media_type: str,
 ) -> ModelT:
-    """Decode an optional XML or YAML request body into a generated model."""
+    """Decode JSON, XML, or YAML in request mode, including a union's native TypeAdapter."""
     body = await request.body()
+    adapter = model_type if isinstance(model_type, TypeAdapter) else TypeAdapter(model_type)
+    if media_type.endswith("+json") or media_type == "application/json":
+        try:
+            return adapter.validate_json(body, context={"mode": "request"})
+        except ValidationError as error:
+            raise ValidationException(
+                detail="Request entity is invalid", extra=error.errors(include_input=False)
+            ) from error
     if media_type.endswith("+xml") or media_type in {"application/xml", "text/xml"}:
         from .xml import XmlCodec
 
@@ -178,7 +186,7 @@ async def request_model[ModelT](
     else:
         raise ValueError(f"Sunday request_model does not support {media_type}")
     try:
-        return TypeAdapter(model_type).validate_python(value, context={"mode": "request"})
+        return adapter.validate_python(value, context={"mode": "request"})
     except ValidationError as error:
         raise ValidationException(
             detail="Request entity is invalid", extra=error.errors(include_input=False)

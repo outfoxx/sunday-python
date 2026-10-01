@@ -32,6 +32,11 @@ class RequestSecurity:
         if manager is None:
             raise TokenProviderError()
         url, headers = request.url, httpx.Headers(request.headers)
+        if "authorization" in headers and not any(
+            binding.transport.location == "header" and binding.transport.name.lower() == "authorization"
+            for binding in self.bindings
+        ):
+            raise TokenProviderError()
         names: set[tuple[str, str]] = set()
         for binding in self.bindings:
             transport = binding.transport

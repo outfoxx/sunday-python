@@ -311,3 +311,32 @@ async def test_provider_ignoring_cancellation_cannot_persist_late_acquisition() 
     finish.set()
     assert (await manager.credentials(BINDING)).tokens.access_token == "fresh"
     assert len(provider.acquisitions) == 2
+
+
+@pytest.mark.anyio
+async def test_interactive_attempt_history_is_bounded_without_reusing_failed_grants() -> None:
+    class FailedProvider(Provider):
+        async def acquire(self, request: TokenRequest) -> TokenSet:
+            self.acquisitions.append(request)
+            raise TokenProviderError()
+
+    provider = FailedProvider()
+    manager = TokenManager({"identity": provider}, now=lambda: 0)
+    binding = replace(BINDING, flow="authorizationCode")
+    for index in range(1024):
+        provider.configuration = replace(provider.configuration, grant_identity=f"session-{index}")
+        with pytest.raises(TokenProviderError):
+            await manager.credentials(binding)
+    assert len(manager._authorization_attempts) == 1024
+    assert all(len(key) == 32 for key in manager._authorization_attempts)
+    for identity in ("new-session", "session-0"):
+        provider.configuration = replace(provider.configuration, grant_identity=identity)
+        with pytest.raises(AuthorizationRequiredError):
+            await manager.credentials(binding)
+    assert len(provider.acquisitions) == 1024
+    assert len(manager._authorization_attempts) == 1024
+    provider.configuration = replace(provider.configuration, grant_identity="authorized-new-lifecycle")
+    fresh = TokenManager({"identity": provider}, now=lambda: 0)
+    with pytest.raises(TokenProviderError):
+        await fresh.credentials(binding)
+    assert len(provider.acquisitions) == 1025

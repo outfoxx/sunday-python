@@ -6,6 +6,7 @@
 """Shared token lifecycle for the supported asyncio runtime."""
 
 import asyncio
+import hashlib
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -51,7 +52,7 @@ class TokenManager:
     """Cache and renew tokens per provider/client/profile/grant on a single asyncio event loop.
 
     A canceled caller leaves other waiters running. Canceling the last waiter cancels acquisition;
-    once refresh has completed, its rotated token is saved even if every caller has canceled.
+    once persistence begins, its rotated token is saved even if every caller has canceled.
     Share one manager for each application token store to coalesce renewal across clients.
     """
 
@@ -71,7 +72,7 @@ class TokenManager:
         self._now = now
         self._renewals: dict[str, _Renewal] = {}
         self._locks: dict[str, _Lock] = {}
-        self._authorization_attempts: set[str] = set()
+        self._authorization_attempts: set[bytes] = set()
 
     async def credentials(self, binding: SecurityBinding) -> TokenLease:
         """Obtain current credentials without reusing a failed or consumed authorization grant."""
@@ -156,6 +157,7 @@ class TokenManager:
                 self._locks.pop(key, None)
 
     async def _renew(self, key: str, provider: TokenProvider, request: TokenRequest) -> TokenLease:
+        authorization_key = hashlib.sha256(key.encode()).digest()
         try:
             async with self._exclusive(key):
                 stored = await self._store.load(key)
@@ -173,12 +175,15 @@ class TokenManager:
                         await self._store.remove(key)
                         tokens = await provider.acquire(request)
                 elif request.flow == "authorizationCode" and (
-                    stored is not None or key in self._authorization_attempts
+                    stored is not None or authorization_key in self._authorization_attempts
                 ):
                     raise AuthorizationRequiredError()
                 else:
                     if request.flow == "authorizationCode":
-                        self._authorization_attempts.add(key)
+                        # Never evict a consumed grant to make space: that would permit reuse.
+                        if len(self._authorization_attempts) >= 1024:
+                            raise AuthorizationRequiredError()
+                        self._authorization_attempts.add(authorization_key)
                     tokens = await provider.acquire(request)
                 if not tokens.access_token or (
                     tokens.expires_at is not None

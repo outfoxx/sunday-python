@@ -321,3 +321,102 @@ def test_nested_collisions_use_the_original_wire_path() -> None:
         Container.model_validate({"wire-values": [item]})
     assert error.value.errors()[0]["type"] == "model_key_conflict"
     assert error.value.errors()[0]["loc"] == ("wire-values", 0, "projectId")
+
+
+def test_declared_unknown_values_are_distinct_from_configured_fallback_members() -> None:
+    from enum import StrEnum
+
+    class DeclaredState(StrEnum):
+        UNKNOWN = "unknown"
+
+    assert TypeAdapter(DeclaredState).validate_python("unknown", context={"mode": "request"}) is DeclaredState.UNKNOWN
+    for value in (State.UNKNOWN, State("future")):
+        with pytest.raises(ValidationError, match="Unknown enum"):
+            TypeAdapter(State).validate_python(value, context={"mode": "request"})
+
+
+@pytest.mark.parametrize("use_alias", [False, True])
+def test_validation_alias_rechecks_existing_values_without_using_serialization_alias(use_alias: bool) -> None:
+    class Named(SundayModel):
+        model_config = ConfigDict(extra="forbid")
+        value: str | None = Field(default=None, validation_alias="wire", serialization_alias="output")
+
+        @field_validator("value")
+        @classmethod
+        def non_nullable(cls, value: str | None) -> str:
+            if value is None:
+                raise ValueError("value is not nullable")
+            return value
+
+    value = Named.model_validate({"wire": "valid"})
+    assert Named.model_validate(value, by_alias=use_alias, by_name=not use_alias).value == "valid"
+    omitted = Named()
+    assert Named.model_validate(omitted, by_alias=use_alias, by_name=not use_alias).model_fields_set == set()
+    assert value.model_dump(by_alias=True) == {"output": "valid"}
+    value.value = None
+    with pytest.raises(ValidationError) as error:
+        Named.model_validate(value, by_alias=use_alias, by_name=not use_alias)
+    assert error.value.errors()[0]["loc"] == ("wire" if use_alias else "value",)
+    assert value.value is None
+    assert value.model_fields_set == {"value"}
+
+
+@pytest.mark.parametrize(
+    "annotation,unknown,known",
+    [
+        (list[Item], [{"state": "future"}], [{"state": "active"}]),
+        (dict[str, Item], {"one": {"state": "future"}}, {"one": {"state": "active"}}),
+        (Item | None, {"state": "future"}, {"state": "active"}),
+    ],
+)
+def test_litestar_native_containers_and_optional_models_preserve_request_mode(
+    annotation: Any, unknown: Any, known: Any
+) -> None:
+    from litestar import Litestar, post
+    from litestar.testing import TestClient
+
+    from sunday.litestar import SundayPlugin
+
+    calls = 0
+
+    async def update(data: Any) -> dict[str, bool]:
+        nonlocal calls
+        calls += 1
+        return {"accepted": True}
+
+    update.__annotations__["data"] = annotation
+    with TestClient(Litestar([post("/items")(update)], plugins=[SundayPlugin()])) as client:
+        assert client.post("/items", json=unknown).status_code == 400
+        assert calls == 0
+        assert client.post("/items", json=known).status_code == 201
+        assert calls == 1
+
+
+def test_litestar_union_request_adapter_rejects_unknowns_before_application_invocation() -> None:
+    from litestar import Litestar, post
+    from litestar.testing import TestClient
+
+    from sunday.litestar import SundayPlugin, request_model
+
+    class Other(SundayModel):
+        other: int
+
+    adapter = TypeAdapter[Item | Other](Item | Other)
+    calls = 0
+
+    @post("/items")
+    async def update(request: Any) -> dict[str, bool]:
+        nonlocal calls
+        await request_model(adapter, request, "application/json")
+        calls += 1
+        return {"accepted": True}
+
+    with TestClient(Litestar([update], plugins=[SundayPlugin()])) as client:
+        assert client.post("/items", json={"state": "future"}).status_code == 400
+        assert (
+            client.post("/items", content="{invalid", headers={"content-type": "application/json"}).status_code == 400
+        )
+        assert calls == 0
+        assert client.post("/items", json={"state": "active"}).status_code == 201
+        assert client.post("/items", json={"other": 1}).status_code == 201
+        assert calls == 2

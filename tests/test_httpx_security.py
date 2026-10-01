@@ -324,3 +324,55 @@ async def test_event_reconnects_after_temporary_token_outage() -> None:
             await stream.aclose()
         assert values == ["recovered"]
     assert provider.acquisitions == 2
+
+
+@pytest.mark.anyio
+async def test_borrowed_default_authorization_is_not_an_unselected_credential() -> None:
+    binding = replace(BINDING, transport=SecurityTransport(location="header", name="X-API-Key"))
+    seen: list[httpx.Headers] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        base_url="https://api.example",
+        transport=httpx.MockTransport(handle),
+        headers={"Authorization": "Bearer ambient"},
+    ) as client:
+        transport = HttpxTransport(client, token_manager=TokenManager({"identity": Provider()}))
+        await send(transport, RequestSpec("GET", "/managed", security=(binding,)))
+        await send(transport, RequestSpec("GET", "/unmanaged"))
+        assert client.headers["authorization"] == "Bearer ambient"
+        with pytest.raises(TokenProviderError):
+            await send(
+                transport,
+                RequestSpec("GET", "/managed", security=(binding,), headers=(("Authorization", "Bearer explicit"),)),
+            )
+    assert len(seen) == 2
+    assert "authorization" not in seen[0]
+    assert seen[0]["x-api-key"] == "access-1"
+    assert seen[1]["authorization"] == "Bearer ambient"
+
+
+@pytest.mark.anyio
+async def test_credentials_are_checked_once_at_send_and_again_on_native_request_reuse() -> None:
+    class CountingProvider(Provider):
+        configurations = 0
+
+        def configure(self, binding: SecurityBinding) -> TokenConfiguration:
+            self.configurations += 1
+            return super().configure(binding)
+
+    provider = CountingProvider()
+    async with httpx.AsyncClient(
+        base_url="https://api.example", transport=httpx.MockTransport(lambda _: httpx.Response(204))
+    ) as client:
+        transport = HttpxTransport(client, token_manager=TokenManager({"identity": provider}))
+        native = await transport.transport_request(RequestSpec("GET", "/value", security=(BINDING,)))
+        assert provider.configurations == provider.acquisitions == 0
+        await transport.transport_response(native)
+        assert provider.configurations == provider.acquisitions == 1
+        await transport.transport_response(native)
+        assert provider.configurations == 2
+        assert provider.acquisitions == 1

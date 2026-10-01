@@ -144,9 +144,13 @@ audience, and resource. Change provider identity when credential configuration c
 when session or grant inputs change. Share one manager on one asyncio event loop across generated clients;
 its optional `TokenStore` supports application-owned storage. The manager coalesces renewal and defaults to
 30 seconds of expiry skew. Canceling one waiter preserves other waiters; canceling the last cancels
-acquisition, while a completed refresh is saved to preserve rotation.
+acquisition. Once persistence starts, saving a rotated token finishes even if callers cancel. A provider
+result arriving after cancellation cannot start persistence; if the identity server already consumed the
+refresh token despite cancellation, the interactive session requires fresh authorization.
 
-HTTPX attaches every credential in the selected AND alternative before sending. Missing providers or
+HTTPX attaches every credential in the selected AND alternative at send time, once per attempt. Native
+request construction does not acquire credentials. Borrowed-client default Authorization headers are
+removed from managed requests; explicit conflicting credentials fail rather than being combined. Missing providers or
 conflicting credentials fail before network access. It checks credentials on every execution, including
 reused native requests. A bodyless GET/HEAD/OPTIONS receiving `401` with a bearer `invalid_token` challenge
 may renew and replay once; POST, streamed bodies, and `403` never trigger automatic replay. Managed
@@ -160,7 +164,10 @@ allow event connections to reconnect; a rejected refresh grant triggers fresh cl
 for the client-credentials flow. Interactive sessions require fresh application authorization.
 Built-in OAuth providers retain at most 1,024 consumed authorization-code hashes per provider instance.
 After this limit, create a provider for a newly authorized application session; old hashes are never
-evicted to allow code reuse. Refresh exchanges do not consume this history.
+evicted to allow code reuse. Refresh exchanges do not consume this history. Token managers similarly
+retain at most 1,024 hashed interactive grant-attempt identities, including failed attempts, and fail
+closed for further first-time authorizations. Start a fresh manager/provider lifecycle with fresh
+application authorization when that bound is reached; never recycle a consumed grant identity.
 
 ## Errors
 
@@ -193,6 +200,18 @@ model, its extras, or its field-presence set. An ambiguous extra key that would 
 promoted into an omitted field during revalidation produces `model_key_conflict` at its original path.
 Normal alias/name input selection remains Pydantic behavior. Litestar's `SundayPlugin` selects request
 mode before invoking application handlers; Sunday transports check every execution before encoding.
+
+### Litestar composite request bodies
+
+SundayPlugin validates list, map, and optional Sunday models in request mode through Litestar’s native
+decoders. Litestar’s msgspec decoder cannot accept unions containing multiple custom model classes.
+For such bodies, use `await request_model(TypeAdapter(First | Second), request, "application/json")`
+before invoking application logic. The helper delegates to Pydantic with request context and translates
+malformed JSON, unknown enum values, and rejected union fallbacks to HTTP 400.
+
+`TolerantStrEnum` explicitly designates `UNKNOWN` (or `__unknown_member_name__`) as its fallback. Request
+mode rejects that member even when directly constructed. A normal schema that merely declares an
+`UNKNOWN` value uses `StrEnum`, for which the declared value remains valid.
 
 ## Server-sent events
 
