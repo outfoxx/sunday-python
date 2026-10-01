@@ -22,7 +22,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "pydantic>=2.12,<3",
+  "pydantic>=2.13,<3",
   "uritemplate>=4.2,<5",
 ]
 

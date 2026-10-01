@@ -40,6 +40,8 @@ from .event_source import (
 )
 from .headers import ResponseHeaders
 from .media import MediaType
+from .model_intersection import ModelIntersection
+from .model_mode import ModelMode
 from .models import SundayModel, TolerantStrEnum
 from .multipart import MultipartBody, MultipartContent, MultipartPart
 from .observers import LoggingTransportObserver, TransportEvent, TransportEventKind, TransportObserver
@@ -55,10 +57,23 @@ from .parameters import (
 )
 from .patch import MergePatch, PatchDocument, PatchOperation, PatchOperationKind
 from .problems import Problem, ProblemPayload, ProblemRegistry
+from .security import SecurityBinding, SecurityEndpoints, SecurityTransport
 from .specs import NullifySpec, OperationSpec, RequestPayloadSpec, RequestSpec, ResponseHeaderSpec, ResponseSpec
 from .sse import EventParser, EventStreamOptions, ServerSentEvent
 from .streaming import StreamingBody, StreamingBodyChunk, StreamingBodyClose, StreamingBodyContent
+from .token_manager import TokenLease, TokenManager
+from .token_provider import (
+    AuthorizationRequiredError,
+    RefreshingTokenProvider,
+    TokenConfiguration,
+    TokenProvider,
+    TokenProviderError,
+    TokenRequest,
+    TokenSet,
+    TokenStore,
+)
 from .transport import BaseTransport, EventStream, ProblemRegistrar, Transport
+from .unknown_model import UnknownModel
 from .uri import URITemplate
 
 try:
@@ -67,6 +82,7 @@ except PackageNotFoundError:  # pragma: no cover - source tree without an editab
     __version__ = "0.0.0"
 
 __all__ = [
+    "AuthorizationRequiredError",
     "BaseTransport",
     "BinaryCodec",
     "EncodedParameters",
@@ -87,6 +103,8 @@ __all__ = [
     "MediaTypeEncoder",
     "MediaTypeEncoders",
     "MergePatch",
+    "ModelIntersection",
+    "ModelMode",
     "MultipartBody",
     "MultipartContent",
     "MultipartPart",
@@ -105,6 +123,7 @@ __all__ = [
     "ProblemPayload",
     "ProblemRegistrar",
     "ProblemRegistry",
+    "RefreshingTokenProvider",
     "RequestEncodingError",
     "RequestPayloadSpec",
     "RequestSpec",
@@ -114,6 +133,9 @@ __all__ = [
     "ResponseHeaders",
     "ResponseSpec",
     "ResponseValidationError",
+    "SecurityBinding",
+    "SecurityEndpoints",
+    "SecurityTransport",
     "ServerSentEvent",
     "StreamingBody",
     "StreamingBodyChunk",
@@ -123,6 +145,14 @@ __all__ = [
     "SundayError",
     "SundayModel",
     "TextCodec",
+    "TokenConfiguration",
+    "TokenLease",
+    "TokenManager",
+    "TokenProvider",
+    "TokenProviderError",
+    "TokenRequest",
+    "TokenSet",
+    "TokenStore",
     "TolerantStrEnum",
     "Transport",
     "TransportError",
@@ -131,6 +161,7 @@ __all__ = [
     "TransportObserver",
     "URITemplate",
     "UnexpectedResponse",
+    "UnknownModel",
     "WireMode",
     "__version__",
     "encode_parameters",

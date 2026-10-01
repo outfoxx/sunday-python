@@ -7,9 +7,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from typing import Any
+
+from pydantic import TypeAdapter
 
 from .media import MediaType
 from .parameters import ParameterSpec
+from .security import SecurityBinding
 from .uri import URITemplate
 
 
@@ -19,6 +23,7 @@ class RequestPayloadSpec[RequestBodyT]:
 
     body: RequestBodyT
     content_types: tuple[MediaType, ...]
+    body_adapter: TypeAdapter[Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +38,9 @@ class RequestSpec[RequestBodyT]:
     content_types: tuple[MediaType, ...] = ()
     accept_types: tuple[MediaType, ...] = ()
     payload: RequestPayloadSpec[RequestBodyT] | None = None
+    security: tuple[SecurityBinding, ...] | None = None
     template_parameters: Mapping[str, object | None] = field(default_factory=dict)
+    body_adapter: TypeAdapter[Any] | None = None
 
     def __post_init__(self) -> None:
         if self.payload is not None and (self.body is not None or self.content_types):
@@ -42,6 +49,12 @@ class RequestSpec[RequestBodyT]:
     def with_headers(self, *headers: tuple[str, str]) -> RequestSpec[RequestBodyT]:
         """Return a request specification with appended headers."""
         return replace(self, headers=(*self.headers, *headers))
+
+    def validate_body(self) -> None:
+        """Revalidate the participating payload with native request-mode rules before encoding."""
+        adapter = self.payload.body_adapter if self.payload is not None else self.body_adapter
+        if adapter is not None:
+            adapter.validate_python(self.effective_body, strict=True, context={"mode": "request"})
 
     @property
     def effective_body(self) -> RequestBodyT | None:

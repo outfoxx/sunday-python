@@ -99,15 +99,16 @@ def test_server_response_and_query_model_preserve_wire_metadata() -> None:
     assert response.json() == {"project-id": "one"}
 
 
-def test_optional_yaml_and_xml_request_response_models() -> None:
+@pytest.mark.parametrize("parameters", ["", "; charset=utf-8"])
+def test_optional_yaml_and_xml_request_response_models(parameters: str) -> None:
     @post("/yaml")
     async def yaml_route(request: Request[Any, Any, Any]) -> object:
-        configuration = await request_model(Configuration, request, "application/yaml")
+        configuration = await request_model(Configuration, request, request.headers["content-type"])
         return ServerResponse(configuration, {}, media_type="application/yaml").to_response()
 
     @post("/xml")
     async def xml_route(request: Request[Any, Any, Any]) -> object:
-        envelope = await request_model(ConfigurationEnvelope, request, "application/xml")
+        envelope = await request_model(ConfigurationEnvelope, request, request.headers["content-type"])
         return ServerResponse(envelope, {}, media_type="application/xml").to_response()
 
     @post("/unsupported")
@@ -118,11 +119,13 @@ def test_optional_yaml_and_xml_request_response_models() -> None:
     with TestClient(
         Litestar(route_handlers=[yaml_route, xml_route, unsupported_route], plugins=[SundayPlugin()])
     ) as client:
-        yaml_response = client.post("/yaml", content="name: Roadmap", headers={"content-type": "application/yaml"})
+        yaml_response = client.post(
+            "/yaml", content="name: Roadmap", headers={"content-type": f"application/yaml{parameters}"}
+        )
         xml_response = client.post(
             "/xml",
             content="<Configuration><name>Roadmap</name></Configuration>",
-            headers={"content-type": "application/xml"},
+            headers={"content-type": f"application/xml{parameters}"},
         )
         assert client.post("/unsupported", content="name,Roadmap").status_code == 201
 

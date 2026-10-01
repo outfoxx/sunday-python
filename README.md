@@ -97,6 +97,78 @@ Generated clients expose their `transport`, `default_content_types`, and `defaul
 declarations take precedence when they cannot use the client defaults, and an explicit Content-Type header remains
 authoritative.
 
+## Profiled credentials
+
+Generated operations carry selected `SecurityBinding` metadata in `RequestSpec.security`. Applications
+register providers on a shared `TokenManager` and pass it to `HttpxTransport(token_manager=...)`.
+Providers and token storage stay in the application; generated code contains no credentials.
+
+```python
+import httpx
+from sunday import TokenManager
+from sunday.httpx import HttpxOAuthTokenProvider, HttpxTransport
+
+
+def create_transport(client: httpx.AsyncClient, client_secret: str) -> HttpxTransport:
+    # The caller owns and closes the borrowed client.
+    provider = HttpxOAuthTokenProvider(
+        client,
+        identity="service-credential-v1",
+        client_id="service-client",
+        client_secret=client_secret,
+        authentication="client_secret_basic",
+    )
+    return HttpxTransport(
+        client,
+        token_manager=TokenManager({"service-identity": provider}),
+    )
+```
+
+For an interactive public client, use `authentication="none"`, a fresh `grant_identity`, and an async
+`authorization(request)` callback returning `AuthorizationGrant(code, redirect_uri, code_verifier)`.
+The application performs the browser flow using S256 PKCE and verifies state, issuer, and redirect URI
+before supplying the result. A code is consumed once, even if exchange fails or is canceled. An expired
+session without refresh capability, or an invalid interactive refresh grant, raises
+`AuthorizationRequiredError`; supply fresh application authorization with a new grant identity.
+Discovery requires the separately configured `issuer`. Acquisition `endpoints` overrides do not change it.
+Token exchanges support `client_secret_basic`, `client_secret_post`, and public-client `none` authentication;
+other methods use an application `TokenProvider`. HTTPS is required except for loopback development URLs.
+
+Custom `TokenProvider` implementations supply external or static credentials through `configure` and
+`acquire`; implementing `refresh` adds optional refresh capability. `TokenSet.expires_at` is Unix seconds.
+Return a new `refresh_token` when it rotates; omitting it retains the previous token. Provider exceptions
+become safe `TokenProviderError` diagnostics. Cancellation still propagates normally.
+
+Cache keys include provider/client identity, grant identity, profile, flow, resolved endpoints, scopes,
+audience, and resource. Change provider identity when credential configuration changes, and grant identity
+when session or grant inputs change. Share one manager on one asyncio event loop across generated clients;
+its optional `TokenStore` supports application-owned storage. The manager coalesces renewal and defaults to
+30 seconds of expiry skew. Canceling one waiter preserves other waiters; canceling the last cancels
+acquisition. Once persistence starts, saving a rotated token finishes even if callers cancel. A provider
+result arriving after cancellation cannot start persistence; if the identity server already consumed the
+refresh token despite cancellation, the interactive session requires fresh authorization.
+
+HTTPX attaches every credential in the selected AND alternative at send time, once per attempt. Native
+request construction does not acquire credentials. Borrowed-client default Authorization headers are
+removed from managed requests; explicit conflicting credentials fail rather than being combined. Missing providers or
+conflicting credentials fail before network access. It checks credentials on every execution, including
+reused native requests. A bodyless GET/HEAD/OPTIONS receiving `401` with a bearer `invalid_token` challenge
+may renew and replay once; POST, streamed bodies, and `403` never trigger automatic replay. Managed
+credential requests do not follow redirects or apply HTTPX client-level auth. Managed query/header/cookie
+credentials are redacted from Sunday observers and response/error request diagnostics. Plain request
+adapters retain their existing behavior when no managed binding is selected.
+
+Credentials are isolated by logical security scheme as well as provider and acquisition inputs.
+Discovery metadata is fetched and verified on each acquisition or renewal. Temporary provider outages
+allow event connections to reconnect; a rejected refresh grant triggers fresh client credentials only
+for the client-credentials flow. Interactive sessions require fresh application authorization.
+Built-in OAuth providers retain at most 1,024 consumed authorization-code hashes per provider instance.
+After this limit, create a provider for a newly authorized application session; old hashes are never
+evicted to allow code reuse. Refresh exchanges do not consume this history. Token managers similarly
+retain at most 1,024 hashed interactive grant-attempt identities, including failed attempts, and fail
+closed for further first-time authorizations. Start a fresh manager/provider lifecycle with fresh
+application authorization when that bound is reached; never recycle a consumed grant identity.
+
 ## Errors
 
 Sunday-originated failures are grouped as `RequestEncodingError`, `ResponseDecodingError`, `ResponseValidationError`, and
@@ -115,6 +187,31 @@ and YAML extras. Their deterministic preference order is JSON, CBOR, XML, YAML, 
 Passing a custom encoder or decoder registry is authoritative and disables this automatic composition. Request content
 negotiation honors an explicit `Content-Type`; otherwise it selects the first declared installed encoder. Generated
 `Accept` values include only installed decoders.
+
+## Model validation
+
+Generated models use Pydantic's native validation API. Select the payload mode with
+`Item.model_validate(item, strict=True, context={"mode": ModelMode.REQUEST})`, or an equivalent
+`TypeAdapter` call. Response mode permits declared tolerant fallbacks; request mode rejects them unless
+the schema explicitly allows them. Constructors use response semantics.
+
+`SundayModel` rechecks current instance values, including mutations, without changing the application
+model, its extras, or its field-presence set. An ambiguous extra key that would overwrite a field or be
+promoted into an omitted field during revalidation produces `model_key_conflict` at its original path.
+Normal alias/name input selection remains Pydantic behavior. Litestar's `SundayPlugin` selects request
+mode before invoking application handlers; Sunday transports check every execution before encoding.
+
+### Litestar composite request bodies
+
+SundayPlugin validates list, map, and optional Sunday models in request mode through Litestar’s native
+decoders. Litestar’s msgspec decoder cannot accept unions containing multiple custom model classes.
+For such bodies, use `await request_model(TypeAdapter(First | Second), request, "application/json")`
+before invoking application logic. The helper delegates to Pydantic with request context and translates
+malformed JSON, unknown enum values, and rejected union fallbacks to HTTP 400.
+
+`TolerantStrEnum` explicitly designates `UNKNOWN` (or `__unknown_member_name__`) as its fallback. Request
+mode rejects that member even when directly constructed. A normal schema that merely declares an
+`UNKNOWN` value uses `StrEnum`, for which the declared value remains valid.
 
 ## Server-sent events
 
@@ -152,3 +249,5 @@ mise run check
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the validation and release rules.
 The [parity matrix](docs/parity.md) records the generator IR boundary and intentional exclusions for the first beta.
 The [beta migration guide](docs/migration.md) covers the breaking transport, client, ownership, and error changes.
+
+Model revalidation requires Pydantic 2.13 or newer, including native dictionary-subclass alias lookup and field-presence handling.
