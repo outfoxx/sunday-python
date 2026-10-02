@@ -56,6 +56,7 @@ from .parameters import (
     parameter_value,
 )
 from .patch import MergePatch, PatchDocument, PatchOperation, PatchOperationKind
+from .patch_model import SundayPatchModel
 from .problems import Problem, ProblemPayload, ProblemRegistry
 from .security import SecurityBinding, SecurityEndpoints, SecurityTransport
 from .specs import NullifySpec, OperationSpec, RequestPayloadSpec, RequestSpec, ResponseHeaderSpec, ResponseSpec
@@ -74,6 +75,7 @@ from .token_provider import (
 )
 from .transport import BaseTransport, EventStream, ProblemRegistrar, Transport
 from .unknown_model import UnknownModel
+from .unset import UNSET, UnsetType, is_unset
 from .uri import URITemplate
 
 try:
@@ -82,6 +84,7 @@ except PackageNotFoundError:  # pragma: no cover - source tree without an editab
     __version__ = "0.0.0"
 
 __all__ = [
+    "UNSET",
     "AuthorizationRequiredError",
     "BaseTransport",
     "BinaryCodec",
@@ -144,6 +147,7 @@ __all__ = [
     "StreamingOperation",
     "SundayError",
     "SundayModel",
+    "SundayPatchModel",
     "TextCodec",
     "TokenConfiguration",
     "TokenLease",
@@ -162,9 +166,11 @@ __all__ = [
     "URITemplate",
     "UnexpectedResponse",
     "UnknownModel",
+    "UnsetType",
     "WireMode",
     "__version__",
     "encode_parameters",
+    "is_unset",
     "parameter_object",
     "parameter_value",
 ]

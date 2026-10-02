@@ -259,3 +259,29 @@ built, including requests without a body. Generated callbacks use Pydantic reque
 failures become `RequestEncodingError`. Custom transports must call `validate_parameters()` before
 encoding parameters on every execution. Litestar `query_model` also validates in request mode and
 returns HTTP 400 before invoking application code when validation fails.
+
+## Typed PATCH models
+
+Generated partial-update models extend `SundayPatchModel`. Each field supports `UNSET` for unchanged,
+a value to set, and `None` only when the schema permits deleting the member. JSON Merge Patch null
+means deletion, never assignment of a literal null. Omitted constructor arguments
+are `UNSET`; schema defaults never become implicit updates.
+
+```python
+from pydantic import Field
+from sunday import UNSET, SundayPatchModel, UnsetType, is_unset
+
+class ItemPatch(SundayPatchModel):
+    name: str | UnsetType = Field(default_factory=lambda: UNSET, exclude_if=is_unset, min_length=2)
+    description: str | UnsetType | None = Field(default_factory=lambda: UNSET, exclude_if=is_unset)
+
+patch = ItemPatch(name="New name", description=None)
+patch.name = UNSET  # Cancel the name update.
+assert patch.model_dump(mode="json") == {"description": None}
+```
+
+Pydantic selects aliases and field names before the runtime handles `UNSET`. Supplied values retain
+normal field validation, including validation during request-mode instance revalidation. `UNSET`
+is a typed, copyable, picklable singleton; it is omitted from JSON Schema and serialization by the
+field configuration above. A literal string `"UNSET"` remains an ordinary string value. Keep the
+`default_factory` and `exclude_if` configuration when defining patch models manually.
