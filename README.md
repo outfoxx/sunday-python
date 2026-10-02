@@ -251,3 +251,11 @@ The [parity matrix](docs/parity.md) records the generator IR boundary and intent
 The [beta migration guide](docs/migration.md) covers the breaking transport, client, ownership, and error changes.
 
 Model revalidation requires Pydantic 2.13 or newer, including native dictionary-subclass alias lookup and field-presence handling.
+
+### Typed request parameters
+
+`RequestSpec.parameter_validation` checks captured typed parameters before each native request is
+built, including requests without a body. Generated callbacks use Pydantic request-mode validation;
+failures become `RequestEncodingError`. Custom transports must call `validate_parameters()` before
+encoding parameters on every execution. Litestar `query_model` also validates in request mode and
+returns HTTP 400 before invoking application code when validation fails.

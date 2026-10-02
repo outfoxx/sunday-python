@@ -139,7 +139,10 @@ def query_model[ModelT](model_type: type[ModelT], request: Request[Any, Any, Any
             previous.append(value)
         else:
             values[name] = [previous, value]
-    return TypeAdapter(model_type).validate_python(values)
+    try:
+        return TypeAdapter(model_type).validate_python(values, context={"mode": "request"})
+    except ValidationError as error:
+        raise ValidationException(detail=str(error)) from error
 
 
 async def request_bytes(request: Request[Any, Any, Any], media_types: Sequence[str]) -> bytes:

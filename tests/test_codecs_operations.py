@@ -40,6 +40,7 @@ from sunday import (
     PatchOperationKind,
     Problem,
     ProblemPayload,
+    RequestEncodingError,
     RequestSpec,
     ResponseHeaders,
     ResponseSpec,
@@ -431,3 +432,33 @@ def test_json_codec_preserves_nullable_fields_and_omits_absent_non_nullable_fiel
     assert json.loads(codec.encode({"nested": [value]})) == {"nested": [expected]}
     value.optional_text = "main"
     assert json.loads(codec.encode(value)) == dict(expected, optionalText="main")
+
+
+def test_bodyless_request_parameter_validation_rechecks_mutation() -> None:
+    import asyncio
+
+    asyncio.run(_bodyless_parameter_check())
+
+
+async def _bodyless_parameter_check() -> None:
+    from sunday.httpx import HttpxTransport
+
+    values = ["known"]
+    validations = 0
+
+    def validate_parameters() -> None:
+        nonlocal validations
+        validations += 1
+        if values != ["known"]:
+            raise ValueError("unknown parameter")
+
+    spec: RequestSpec[None] = RequestSpec(
+        method="GET", path_template="/parameters", parameter_validation=validate_parameters
+    )
+    async with HttpxTransport(base_url="https://example.com") as transport:
+        assert validations == 0
+        await transport.transport_request(spec)
+        values.append("unknown")
+        with pytest.raises(RequestEncodingError):
+            await transport.transport_request(spec)
+        assert validations == 2

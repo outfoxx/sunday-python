@@ -163,3 +163,32 @@ def test_problem_response_preserves_nullable_extension_fields() -> None:
         response = client.get("/nullable-problem")
     assert response.status_code == 400
     assert response.json() == {"type": "about:blank", "status": 400, "requiredNullable": None}
+
+
+def test_query_models_validate_in_request_mode_before_delegate() -> None:
+    from pydantic import ValidationInfo, field_validator
+
+    class Query(SundayModel):
+        states: list[str]
+
+        @field_validator("states")
+        @classmethod
+        def known_states(cls, value: list[str], info: ValidationInfo) -> list[str]:
+            if info.context == {"mode": "request"} and "future" in value:
+                raise ValueError("Unknown request state")
+            return value
+
+    calls = 0
+
+    @get("/query")
+    async def query(request: Request[Any, Any, Any]) -> list[str]:
+        nonlocal calls
+        model = query_model(Query, request)
+        calls += 1
+        return model.states
+
+    with TestClient(Litestar(route_handlers=[query], plugins=[SundayPlugin()])) as client:
+        assert client.get("/query?states=ready&states=future").status_code == 400
+        assert calls == 0
+        assert client.get("/query?states=ready&states=active").json() == ["ready", "active"]
+        assert calls == 1

@@ -112,6 +112,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         return adapted
 
     def _build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
+        spec.validate_parameters()
         spec.validate_body()
         parameters = encode_parameters(spec.parameters)
         if isinstance(spec.path_template, URITemplate):
