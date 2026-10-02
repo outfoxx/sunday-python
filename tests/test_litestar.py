@@ -188,7 +188,11 @@ def test_query_models_validate_in_request_mode_before_delegate() -> None:
         return model.states
 
     with TestClient(Litestar(route_handlers=[query], plugins=[SundayPlugin()])) as client:
-        assert client.get("/query?states=ready&states=future").status_code == 400
+        response = client.get("/query?states=ready&states=future")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Request entity is invalid"
+        assert response.json()["extra"][0]["loc"] == ["states"]
+        assert "input" not in response.json()["extra"][0]
         assert calls == 0
         assert client.get("/query?states=ready&states=active").json() == ["ready", "active"]
         assert calls == 1

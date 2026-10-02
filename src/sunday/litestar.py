@@ -114,7 +114,7 @@ def _decode_request_model(model_type: type[BaseModel], value: Any) -> BaseModel:
         return model_type.model_validate(value, context={"mode": "request"})
     except ValidationError as error:
         raise ValidationException(
-            detail="Request entity is invalid", extra=error.errors(include_input=False)
+            detail="Request entity is invalid", extra=error.errors(include_input=False, include_context=False)
         ) from error
 
 
@@ -142,7 +142,9 @@ def query_model[ModelT](model_type: type[ModelT], request: Request[Any, Any, Any
     try:
         return TypeAdapter(model_type).validate_python(values, context={"mode": "request"})
     except ValidationError as error:
-        raise ValidationException(detail=str(error)) from error
+        raise ValidationException(
+            detail="Request entity is invalid", extra=error.errors(include_input=False, include_context=False)
+        ) from error
 
 
 async def request_bytes(request: Request[Any, Any, Any], media_types: Sequence[str]) -> bytes:
@@ -177,7 +179,7 @@ async def request_model[ModelT](
             return adapter.validate_json(body, context={"mode": "request"})
         except ValidationError as error:
             raise ValidationException(
-                detail="Request entity is invalid", extra=error.errors(include_input=False)
+                detail="Request entity is invalid", extra=error.errors(include_input=False, include_context=False)
             ) from error
     if parsed_media_type.suffix == "xml" or (
         parsed_media_type.type in {"application", "text"} and parsed_media_type.subtype == "xml"
@@ -197,7 +199,7 @@ async def request_model[ModelT](
         return adapter.validate_python(value, context={"mode": "request"})
     except ValidationError as error:
         raise ValidationException(
-            detail="Request entity is invalid", extra=error.errors(include_input=False)
+            detail="Request entity is invalid", extra=error.errors(include_input=False, include_context=False)
         ) from error
 
 

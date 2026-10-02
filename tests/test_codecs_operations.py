@@ -441,6 +441,7 @@ def test_bodyless_request_parameter_validation_rechecks_mutation() -> None:
 
 
 async def _bodyless_parameter_check() -> None:
+    from sunday import ParameterLocation, ParameterSpec
     from sunday.httpx import HttpxTransport
 
     values = ["known"]
@@ -453,11 +454,15 @@ async def _bodyless_parameter_check() -> None:
             raise ValueError("unknown parameter")
 
     spec: RequestSpec[None] = RequestSpec(
-        method="GET", path_template="/parameters", parameter_validation=validate_parameters
+        method="GET",
+        path_template="/parameters",
+        parameters=(ParameterSpec("state", values, ParameterLocation.QUERY),),
+        parameter_validation=validate_parameters,
     )
     async with HttpxTransport(base_url="https://example.com") as transport:
         assert validations == 0
-        await transport.transport_request(spec)
+        request = await transport.transport_request(spec)
+        assert request.url.params.get_list("state") == ["known"]
         values.append("unknown")
         with pytest.raises(RequestEncodingError):
             await transport.transport_request(spec)
