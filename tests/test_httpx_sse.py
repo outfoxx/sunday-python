@@ -12,7 +12,15 @@ import anyio
 import httpx
 import pytest
 
-from sunday import EventSourceState, EventStreamOptions, Problem, RequestSpec, TransportError, UnexpectedResponse
+from sunday import (
+    EventSourceState,
+    EventStreamOptions,
+    Problem,
+    RequestEncodingError,
+    RequestSpec,
+    TransportError,
+    UnexpectedResponse,
+)
 from sunday.httpx import HttpxEventStream, HttpxTransport
 
 
@@ -602,3 +610,39 @@ async def test_closed_event_resources_raise_transport_errors() -> None:
         await transport.aclose()
         with pytest.raises(TransportError, match="HttpxTransport is closed"):
             source.connect()
+
+
+@pytest.mark.anyio
+async def test_invalid_parameters_are_terminal_encoding_errors_for_sse() -> None:
+    validations = 0
+    sends = 0
+    failure = ValueError("Unknown parameter")
+
+    def validate() -> None:
+        nonlocal validations
+        validations += 1
+        raise failure
+
+    def send(_request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return httpx.Response(204)
+
+    spec: RequestSpec[None] = RequestSpec("GET", "/events", parameter_validation=validate)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(send), base_url="https://example.com") as client:
+        transport = HttpxTransport(client)
+        stream = transport.event_stream(spec, lambda event: event.data)
+        with anyio.fail_after(1), pytest.raises(RequestEncodingError) as raised:
+            await anext(aiter(stream))
+        assert raised.value.__cause__ is failure
+        assert validations == 1
+        source = transport.event_source(spec)
+        errors: list[BaseException | None] = []
+        source.on_error = errors.append
+        source.connect()
+        with anyio.fail_after(1):
+            await source._wait_closed()
+        assert len(errors) == 1 and isinstance(errors[0], RequestEncodingError)
+        assert errors[0].__cause__ is failure
+        assert validations == 2
+        assert sends == 0

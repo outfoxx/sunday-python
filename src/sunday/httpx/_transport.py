@@ -97,8 +97,15 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         """Build and adapt an HTTPX request from a declarative specification."""
         if self._closed:
             raise TransportError("HttpxTransport is closed")
+        request = self._build_request(spec)
+        adapted = await self._adapt_request(request)
+        if adapted is not request and request in self._request_security:
+            self._request_security[adapted] = self._request_security[request]
+        return adapted
+
+    def _build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
         try:
-            request = self._build_request(spec)
+            return self._build_validated_request(spec)
         except RequestEncodingError:
             raise
         except (TypeError, ValueError) as error:
@@ -106,12 +113,9 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                 "Request encoding failed",
                 details={"method": spec.method, "path_template": str(spec.path_template)},
             ) from error
-        adapted = await self._adapt_request(request)
-        if adapted is not request and request in self._request_security:
-            self._request_security[adapted] = self._request_security[request]
-        return adapted
 
-    def _build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
+    def _build_validated_request(self, spec: RequestSpec[Any]) -> httpx.Request:
+        spec.validate_parameters()
         spec.validate_body()
         parameters = encode_parameters(spec.parameters)
         if isinstance(spec.path_template, URITemplate):

@@ -41,6 +41,7 @@ class RequestSpec[RequestBodyT]:
     security: tuple[SecurityBinding, ...] | None = None
     template_parameters: Mapping[str, object | None] = field(default_factory=dict)
     body_adapter: TypeAdapter[Any] | None = None
+    parameter_validation: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.payload is not None and (self.body is not None or self.content_types):
@@ -49,6 +50,11 @@ class RequestSpec[RequestBodyT]:
     def with_headers(self, *headers: tuple[str, str]) -> RequestSpec[RequestBodyT]:
         """Return a request specification with appended headers."""
         return replace(self, headers=(*self.headers, *headers))
+
+    def validate_parameters(self) -> None:
+        """Revalidate typed parameters before conversion, including requests without bodies."""
+        if self.parameter_validation is not None:
+            self.parameter_validation()
 
     def validate_body(self) -> None:
         """Revalidate the participating payload with native request-mode rules before encoding."""
