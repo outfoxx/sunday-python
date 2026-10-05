@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Allow public OAuth PKCE acquisition and refresh when discovery omits `none`, including Keycloak metadata, while
+  retaining confidential-client authentication checks and rejecting malformed authentication-method arrays.
+
 - Align HTTPX EventSource and EventStream reconnection with the other Sunday runtimes: 500 ms capped exponential retry,
   downward jitter after the first attempt, reset after opening, dynamic 30-times caps, persistent positive `retry-max:`,
   redirect following, and exact-once request adaptation.
