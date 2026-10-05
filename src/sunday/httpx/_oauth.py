@@ -150,7 +150,10 @@ class HttpxOAuthTokenProvider:
         if response.status_code != 200 or not isinstance(document, dict) or document.get("issuer") != self._issuer:
             raise TokenProviderError()
         methods = document.get("token_endpoint_auth_methods_supported", ["client_secret_basic"])
-        if not isinstance(methods, list) or self._authentication not in methods:
+        if not isinstance(methods, list) or not all(isinstance(method, str) for method in methods):
+            raise TokenProviderError()
+        # Public PKCE clients do not authenticate; providers such as Keycloak need not advertise "none".
+        if self._authentication != "none" and self._authentication not in methods:
             raise TokenProviderError()
         token_url = request.token_url or document.get("token_endpoint")
         authorization_url = request.authorization_url or document.get("authorization_endpoint")

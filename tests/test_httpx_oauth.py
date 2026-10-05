@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import asyncio
 import base64
 from dataclasses import replace
 from typing import Literal
@@ -295,3 +296,283 @@ async def test_consumed_authorization_history_is_bounded_without_reusing_codes()
         with pytest.raises(AuthorizationRequiredError):
             await manager.credentials(replace(BINDING, flow="authorizationCode", scopes=("next",)))
     assert grants == 1024
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"token_endpoint_auth_methods_supported": ["none"]},
+        {
+            "token_endpoint_auth_methods_supported": [
+                "private_key_jwt",
+                "client_secret_basic",
+                "client_secret_post",
+                "tls_client_auth",
+                "client_secret_jwt",
+            ]
+        },
+        {},
+    ],
+    ids=["explicit-none", "keycloak", "omitted"],
+)
+async def test_public_pkce_discovery_and_rotating_refresh(metadata: dict[str, object]) -> None:
+    grants, exchanges, discoveries = [], [], []
+
+    async def authorize(request: TokenRequest) -> AuthorizationGrant:
+        grants.append(request)
+        assert request.authorization_url == "https://identity.example/authorize"
+        return AuthorizationGrant("fresh-code", "http://127.0.0.1:12345/callback", "v" * 43)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert "authorization" not in request.headers and "cookie" not in request.headers
+        assert "x-default" not in request.headers
+        if request.method == "GET":
+            discoveries.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://identity.example",
+                    "authorization_endpoint": "https://identity.example/authorize",
+                    "token_endpoint": "https://identity.example/token",
+                    **metadata,
+                },
+            )
+        assert request.url == "https://identity.example/token"
+        form = parse_qs(request.content.decode())
+        exchanges.append(form)
+        assert form["client_id"] == ["public-client"]
+        assert "client_secret" not in form
+        if len(exchanges) == 1:
+            assert form["grant_type"] == ["authorization_code"]
+            assert form["code"] == ["fresh-code"]
+            assert form["code_verifier"] == ["v" * 43]
+            assert form["redirect_uri"] == ["http://127.0.0.1:12345/callback"]
+        else:
+            assert form["grant_type"] == ["refresh_token"]
+            assert form["refresh_token"] == [f"refresh-{len(exchanges) - 1}"]
+            assert not {"code", "code_verifier", "redirect_uri"}.intersection(form)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": f"token-{len(exchanges)}",
+                "refresh_token": f"refresh-{len(exchanges)}",
+                "token_type": "Bearer",
+                "expires_in": 60,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle),
+        auth=("ambient", "secret"),
+        cookies={"session": "private"},
+        headers={"X-Default": "private"},
+    ) as client:
+        provider = HttpxOAuthTokenProvider(
+            client,
+            identity="app",
+            client_id="public-client",
+            authentication="none",
+            grant_identity="session",
+            authorization=authorize,
+            issuer="https://identity.example",
+            now=lambda: 0,
+        )
+        manager = TokenManager({"identity": provider}, now=lambda: 0)
+        binding = replace(
+            BINDING, flow="authorizationCode", token_url=None, discovery_url="https://identity.example/discovery"
+        )
+        for index in range(1, 4):
+            lease = await manager.credentials(binding)
+            assert lease.tokens.access_token == f"token-{index}"
+            assert lease.tokens.refresh_token == f"refresh-{index}"
+            await manager.invalidate(lease)
+    assert len(grants) == 1
+    assert len(discoveries) == len(exchanges) == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("authentication", ["none", "client_secret_basic", "client_secret_post"])
+@pytest.mark.parametrize("methods", [None, "none", {}, ["none", 1], ["client_secret_basic", None]])
+async def test_discovery_rejects_malformed_authentication_methods(
+    authentication: Literal["none", "client_secret_basic", "client_secret_post"],
+    methods: object,
+) -> None:
+    calls, grants = [], []
+
+    async def authorize(request: TokenRequest) -> AuthorizationGrant:
+        grants.append(request)
+        return AuthorizationGrant("code", "https://app.example/callback", "v" * 43)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "issuer": "https://identity.example",
+                "token_endpoint": "https://identity.example/token",
+                "token_endpoint_auth_methods_supported": methods,
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        provider = HttpxOAuthTokenProvider(
+            client,
+            identity="app",
+            client_id="client",
+            authentication=authentication,
+            client_secret=None if authentication == "none" else "secret",
+            grant_identity="session",
+            authorization=authorize,
+            issuer="https://identity.example",
+        )
+        with pytest.raises(TokenProviderError):
+            await TokenManager({"identity": provider}).credentials(
+                replace(
+                    BINDING,
+                    flow="authorizationCode",
+                    token_url=None,
+                    discovery_url="https://identity.example/discovery",
+                )
+            )
+    assert len(calls) == 1 and calls[0].method == "GET"
+    assert grants == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("authentication", ["client_secret_basic", "client_secret_post"])
+async def test_discovery_rejects_unsupported_confidential_authentication(
+    authentication: Literal["client_secret_basic", "client_secret_post"],
+) -> None:
+    calls = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "issuer": "https://identity.example",
+                "token_endpoint": "https://identity.example/token",
+                "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        provider = HttpxOAuthTokenProvider(
+            client,
+            identity="app",
+            client_id="client",
+            client_secret="secret",
+            authentication=authentication,
+            issuer="https://identity.example",
+        )
+        with pytest.raises(TokenProviderError):
+            await TokenManager({"identity": provider}).credentials(
+                replace(
+                    BINDING,
+                    token_url=None,
+                    discovery_url="https://identity.example/discovery",
+                )
+            )
+    assert len(calls) == 1 and calls[0].method == "GET"
+
+
+@pytest.mark.anyio
+async def test_canceled_pkce_exchange_consumes_authorization_grant() -> None:
+    started = asyncio.Event()
+    calls = []
+
+    async def authorize(_: TokenRequest) -> AuthorizationGrant:
+        return AuthorizationGrant("same-code", "https://app.example/callback", "v" * 43)
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("Canceled exchange must not complete")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        provider = HttpxOAuthTokenProvider(
+            client,
+            identity="app",
+            client_id="public",
+            grant_identity="session",
+            authorization=authorize,
+        )
+        request = TokenRequest(
+            scheme="identity",
+            provider="identity",
+            profile="external",
+            flow="authorizationCode",
+            token_url="https://identity.example/token",
+            client_identity="public",
+            grant_identity="session",
+            transport=BINDING.transport,
+        )
+        task = asyncio.create_task(provider.acquire(request))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(AuthorizationRequiredError):
+            await provider.acquire(request)
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("refresh", [False, True], ids=["acquire", "refresh"])
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"issuer": "https://untrusted.example"},
+        {"token_endpoint": "http://remote.example/token"},
+        {"token_endpoint": "https://user:password@identity.example/token"},
+        {"token_endpoint": "https://identity.example/token#fragment"},
+    ],
+    ids=["issuer-mismatch", "insecure-endpoint", "userinfo", "fragment"],
+)
+async def test_public_discovery_preserves_trust_checks(metadata: dict[str, str], refresh: bool) -> None:
+    calls, grants = [], []
+
+    async def authorize(request: TokenRequest) -> AuthorizationGrant:
+        grants.append(request)
+        return AuthorizationGrant("code", "https://app.example/callback", "v" * 43)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "issuer": "https://identity.example",
+                "token_endpoint": "https://identity.example/token",
+                **metadata,
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        provider = HttpxOAuthTokenProvider(
+            client,
+            identity="app",
+            client_id="public",
+            grant_identity="session",
+            authorization=authorize,
+            issuer="https://identity.example",
+        )
+        request = TokenRequest(
+            scheme="identity",
+            provider="identity",
+            profile="external",
+            flow="authorizationCode",
+            discovery_url="https://identity.example/discovery",
+            client_identity="public",
+            grant_identity="session",
+            transport=BINDING.transport,
+        )
+        with pytest.raises(TokenProviderError):
+            if refresh:
+                await provider.refresh(request, "refresh-secret")
+            else:
+                await provider.acquire(request)
+    assert len(calls) == 1 and calls[0].method == "GET"
+    if "issuer" in metadata or refresh:
+        assert grants == []
