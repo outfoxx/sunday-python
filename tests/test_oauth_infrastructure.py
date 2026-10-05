@@ -2,6 +2,7 @@
 
 import hashlib
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -91,3 +92,27 @@ def test_mac_ci_failure_makes_zero_docker_calls(tmp_path: Path) -> None:
     spawn.assert_not_called()
     discover.assert_not_called()
     assert not provider.directory.exists()
+
+
+@pytest.mark.parametrize(
+    "command", [[sys.executable, "-c", "import time; time.sleep(60)"], [sys.executable, "-c", "raise SystemExit(1)"]]
+)
+def test_real_process_failure_is_reaped(tmp_path: Path, command: list[str]) -> None:
+    provider = Provider("replay", tmp_path, startup_timeout=0.2)
+    with patch.object(provider, "_command", return_value=command), pytest.raises(RuntimeError, match="wiremock-java"):
+        provider.start()
+    assert provider.process is not None
+    assert provider.process.poll() is not None
+    assert not provider.directory.exists()
+    provider.close()
+
+
+def test_bad_download_removes_partial_artifact(tmp_path: Path) -> None:
+    response = Mock()
+    response.iter_bytes.return_value = [b"tampered"]
+    stream = Mock()
+    stream.__enter__ = Mock(return_value=response)
+    stream.__exit__ = Mock(return_value=False)
+    with patch("httpx.stream", return_value=stream), pytest.raises(RuntimeError, match="integrity"):
+        artifact(tmp_path, "https://example.invalid/provider.jar", "invalid")
+    assert list(tmp_path.iterdir()) == []

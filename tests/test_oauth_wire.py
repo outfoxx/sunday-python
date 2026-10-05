@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from sunday import TokenProviderError
+from sunday import TokenProviderError, TokenSet
 from sunday.httpx._oauth_wire import DiscoveryMetadata, TokenErrorResponse, TokenSuccessResponse
 
 CORPUS = json.loads((Path(__file__).parents[1] / "test-fixtures/oauth/cases.json").read_text())
@@ -26,7 +26,15 @@ def test_wire_case(case: dict[str, Any]) -> None:
         )
 
     if case["expected"] == "accept":
-        parse()
+        result = parse()
+        if "tokens" in case:
+            assert isinstance(result, TokenSet)
+            expected = case["tokens"]
+            assert result.access_token == expected["accessToken"]
+            assert result.refresh_token == expected["refreshToken"]
+            assert result.expires_at == (
+                None if expected["expiresAtMillis"] is None else expected["expiresAtMillis"] / 1000
+            )
     else:
         with pytest.raises((ValueError, TypeError, TokenProviderError)):
             parse()

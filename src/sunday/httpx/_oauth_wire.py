@@ -63,6 +63,10 @@ class DiscoveryMetadata:
             endpoint(token)
         if authorization is not None:
             endpoint(authorization)
+        for name in ("jwks_uri", "registration_endpoint", "revocation_endpoint", "introspection_endpoint"):
+            value = _string(data, name)
+            if value is not None:
+                endpoint(value)
         methods = None
         if "token_endpoint_auth_methods_supported" in data:
             raw = data["token_endpoint_auth_methods_supported"]

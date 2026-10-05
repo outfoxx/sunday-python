@@ -5,8 +5,10 @@
 
 import asyncio
 import base64
+import json
 from dataclasses import replace
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import parse_qs
 
 import httpx
@@ -578,3 +580,46 @@ async def test_public_discovery_preserves_trust_checks(metadata: dict[str, str],
                 await provider.acquire(request)
     assert len(calls) == 1 and calls[0].method == "GET"
     assert grants == []
+
+
+HTTP_CORPUS = json.loads((Path(__file__).parents[1] / "test-fixtures/oauth/http-cases.json").read_text())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("case", HTTP_CORPUS["cases"], ids=lambda case: case["id"])
+@pytest.mark.parametrize("refresh", [False, True], ids=["acquire", "refresh"])
+async def test_shared_http_fixtures(case: dict[str, Any], refresh: bool) -> None:
+    assert HTTP_CORPUS["formatVersion"] == 1
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(case["status"], text=case["body"], headers=case["headers"])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        provider = HttpxOAuthTokenProvider(
+            client,
+            identity="app",
+            client_id="client",
+            client_secret="secret",
+            authentication="client_secret_post",
+            issuer="https://trusted.example",
+        )
+        request = TokenRequest(
+            scheme="identity",
+            provider="identity",
+            flow="clientCredentials",
+            client_identity="client",
+            transport=BINDING.transport,
+            token_url="https://identity.example/token",
+            discovery_url="https://identity.example/discovery" if case["target"] == "discovery" else None,
+        )
+        with pytest.raises(TokenProviderError) as failure:
+            if refresh:
+                await provider.refresh(request, "refresh-secret")
+            else:
+                await provider.acquire(request)
+        assert failure.value.reason == case["expected"]
+        assert "SECRET" not in str(failure.value)
+        assert len(calls) == 1
+        assert calls[0].method == ("GET" if case["target"] == "discovery" else "POST")
