@@ -313,8 +313,9 @@ async def test_consumed_authorization_history_is_bounded_without_reusing_codes()
             ]
         },
         {},
+        {"token_endpoint_auth_methods_supported": []},
     ],
-    ids=["explicit-none", "keycloak", "omitted"],
+    ids=["explicit-none", "keycloak", "omitted", "empty"],
 )
 async def test_public_pkce_discovery_and_rotating_refresh(metadata: dict[str, object]) -> None:
     grants, exchanges, discoveries = [], [], []
@@ -411,6 +412,7 @@ async def test_discovery_rejects_malformed_authentication_methods(
             json={
                 "issuer": "https://identity.example",
                 "token_endpoint": "https://identity.example/token",
+                "authorization_endpoint": "https://identity.example/authorize",
                 "token_endpoint_auth_methods_supported": methods,
             },
         )
@@ -545,6 +547,7 @@ async def test_public_discovery_preserves_trust_checks(metadata: dict[str, str],
             json={
                 "issuer": "https://identity.example",
                 "token_endpoint": "https://identity.example/token",
+                "authorization_endpoint": "https://identity.example/authorize",
                 **metadata,
             },
         )
@@ -574,5 +577,4 @@ async def test_public_discovery_preserves_trust_checks(metadata: dict[str, str],
             else:
                 await provider.acquire(request)
     assert len(calls) == 1 and calls[0].method == "GET"
-    if "issuer" in metadata or refresh:
-        assert grants == []
+    assert grants == []
