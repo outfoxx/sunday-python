@@ -111,5 +111,5 @@ def test_core_source_does_not_import_httpx_adapter() -> None:
 def test_httpx_dependencies_are_optional_metadata() -> None:
     project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())["project"]
 
-    assert all(not dependency.startswith(("anyio", "httpx")) for dependency in project["dependencies"])
-    assert project["optional-dependencies"]["httpx"] == ["anyio>=4,<5", "httpx>=0.28,<1"]
+    assert all(not dependency.startswith(("anyio", "httpx", "Authlib")) for dependency in project["dependencies"])
+    assert project["optional-dependencies"]["httpx"] == ["anyio>=4,<5", "httpx>=0.28,<1", "Authlib==1.8.0"]
