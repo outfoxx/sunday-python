@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
@@ -17,9 +16,13 @@ from typing import Literal
 from urllib.parse import quote_plus
 
 import httpx
+from authlib.oauth2.auth import ClientAuth  # type: ignore[import-untyped]
+from authlib.oauth2.rfc6749.parameters import prepare_token_request  # type: ignore[import-untyped]
 
 from ..security import SecurityBinding, SecurityEndpoints
 from ..token_provider import AuthorizationRequiredError, TokenConfiguration, TokenProviderError, TokenRequest, TokenSet
+from ._oauth_wire import DiscoveryMetadata, TokenErrorResponse, TokenSuccessResponse
+from ._oauth_wire import endpoint as _endpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,18 +149,24 @@ class HttpxOAuthTokenProvider:
             follow_redirects=False,
         )
         _check_availability(response.status_code)
-        document = response.json()
-        if response.status_code != 200 or not isinstance(document, dict) or document.get("issuer") != self._issuer:
+        if response.status_code != 200:
             raise TokenProviderError()
-        methods = document.get("token_endpoint_auth_methods_supported", ["client_secret_basic"])
-        if not isinstance(methods, list) or not all(isinstance(method, str) for method in methods):
+        document = DiscoveryMetadata.parse(response.text)
+        if document.issuer != self._issuer:
             raise TokenProviderError()
-        # Public PKCE clients do not authenticate; providers such as Keycloak need not advertise "none".
-        if self._authentication != "none" and self._authentication not in methods:
+        # Public PKCE clients do not authenticate; Keycloak need not advertise "none".
+        public_code = self._authentication == "none" and request.flow == "authorizationCode"
+        methods = document.methods if document.methods is not None else ("client_secret_basic",)
+        if not public_code and self._authentication not in methods:
             raise TokenProviderError()
-        token_url = request.token_url or document.get("token_endpoint")
-        authorization_url = request.authorization_url or document.get("authorization_endpoint")
-        if not isinstance(token_url, str) or (authorization_url is not None and not isinstance(authorization_url, str)):
+        token_url = request.token_url if request.token_url is not None else document.token_url
+        authorization_url = (
+            request.authorization_url if request.authorization_url is not None else document.authorization_url
+        )
+        _endpoint(token_url)
+        if authorization_url is not None:
+            _endpoint(authorization_url)
+        elif request.flow == "authorizationCode":
             raise TokenProviderError()
         return replace(request, token_url=token_url, authorization_url=authorization_url)
 
@@ -168,66 +177,36 @@ class HttpxOAuthTokenProvider:
             form["audience"] = request.audience
         if request.resource is not None:
             form["resource"] = request.resource
-        auth = None
+        grant_type = form.pop("grant_type")
+        body = prepare_token_request(grant_type, **form)
+        client_id, secret = self._client_id, self._secret
         if self._authentication == "client_secret_basic":
-            auth = httpx.BasicAuth(quote_plus(self._client_id), quote_plus(self._secret or ""))
-        else:
-            form["client_id"] = self._client_id
-            if self._authentication == "client_secret_post":
-                form["client_secret"] = self._secret or ""
+            # Authlib applies HTTP Basic directly; OAuth requires form-encoding each credential first.
+            client_id, secret = quote_plus(client_id), quote_plus(secret or "")
+        url, headers, body = ClientAuth(client_id, secret, self._authentication).prepare(
+            "POST",
+            str(_endpoint(endpoint)),
+            {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            body,
+        )
         response = await self._client.send(
-            httpx.Request("POST", _endpoint(endpoint), data=form, headers={"Accept": "application/json"}),
-            auth=auth,
+            httpx.Request("POST", url, content=body, headers=headers),
+            auth=None,
             follow_redirects=False,
         )
         _check_availability(response.status_code)
-        data = response.json()
-        if not isinstance(data, dict):
-            raise TokenProviderError()
         if response.status_code != 200:
-            if data.get("error") == "invalid_grant":
+            code = TokenErrorResponse.parse(response.text).code
+            if code == "invalid_grant":
                 if request.flow == "authorizationCode":
                     raise AuthorizationRequiredError()
                 raise TokenProviderError("invalid_grant")
-            if data.get("error") in ("temporarily_unavailable", "server_error"):
+            if code in ("temporarily_unavailable", "server_error"):
                 raise TokenProviderError("temporary")
             raise TokenProviderError()
-        access_token, token_type = data.get("access_token"), data.get("token_type")
-        if (
-            not isinstance(access_token, str)
-            or not access_token
-            or not isinstance(token_type, str)
-            or token_type.lower() != "bearer"
-        ):
-            raise TokenProviderError()
-        lifetime = data.get("expires_in")
-        expires_at = None
-        if lifetime is not None:
-            if type(lifetime) not in {int, float} or not math.isfinite(lifetime) or lifetime <= 0:
-                raise TokenProviderError()
-            expires_at = self._now() + lifetime
-            if not math.isfinite(expires_at):
-                raise TokenProviderError()
-        refresh_token = data.get("refresh_token")
-        if refresh_token is not None and (not isinstance(refresh_token, str) or not refresh_token):
-            raise TokenProviderError()
-        scope = data.get("scope")
-        if scope is not None and (not isinstance(scope, str) or not set(request.scopes).issubset(scope.split())):
-            raise TokenProviderError()
-        return TokenSet(access_token, expires_at, refresh_token)
+        return TokenSuccessResponse.parse(response.text).tokens(request.scopes, self._now())
 
 
 def _check_availability(status: int) -> None:
     if status in (408, 429) or 500 <= status <= 599:
         raise TokenProviderError("temporary")
-
-
-def _endpoint(value: str | None) -> httpx.URL:
-    if value is None:
-        raise TokenProviderError()
-    url = httpx.URL(value)
-    if not url.is_absolute_url or url.userinfo or url.fragment:
-        raise TokenProviderError()
-    if url.scheme != "https" and not (url.scheme == "http" and url.host in {"localhost", "127.0.0.1", "::1"}):
-        raise TokenProviderError()
-    return url

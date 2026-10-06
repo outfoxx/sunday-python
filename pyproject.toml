@@ -30,6 +30,7 @@ dependencies = [
 httpx = [
   "anyio>=4,<5",
   "httpx>=0.28,<1",
+  "Authlib==1.8.0",
 ]
 litestar = [
   "litestar>=2.18,<3",
@@ -47,6 +48,7 @@ all = [
   "anyio>=4,<5",
   "cbor2>=6,<7",
   "httpx>=0.28,<1",
+  "Authlib==1.8.0",
   "litestar>=2.18,<3",
   "PyYAML>=6.0.3,<7",
   "xmltodict>=1.0.4,<2",
@@ -67,6 +69,7 @@ dev = [
   "types-PyYAML>=6,<7",
   "types-xmltodict>=0.15,<1",
   "sunday-python[all]",
+  "playwright==1.58.0",
 ]
 
 [tool.uv.sources]
