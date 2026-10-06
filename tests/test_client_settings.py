@@ -12,10 +12,14 @@ from sunday import (
     ApiKeyCredentials,
     BearerCredentials,
     ClientSettings,
+    Credentials,
     OAuthCredentials,
     SecurityBinding,
     SecurityEndpoints,
     SecurityTransport,
+    TokenConfiguration,
+    TokenRequest,
+    TokenSet,
 )
 from sunday.httpx import AuthorizationGrant, HttpxTransport
 
@@ -87,8 +91,8 @@ def test_core_credentials_do_not_load_httpx() -> None:
 
 def test_complete_conjunction_public_override_and_selection() -> None:
     key = replace(BINDING, scheme="key", provider="key", transport=SecurityTransport(location="query", name="key"))
-    credentials = {"identity": BearerCredentials("one"), "key": ApiKeyCredentials("two")}
-    alternatives = {"list": [[BINDING, key], [BINDING]], "public": [[]]}
+    credentials: dict[str, Credentials] = {"identity": BearerCredentials("one"), "key": ApiKeyCredentials("two")}
+    alternatives: dict[str, list[list[SecurityBinding]]] = {"list": [[BINDING, key], [BINDING]], "public": [[]]}
     with pytest.raises(ValueError, match="one complete"):
         ClientSettings.resolve("https://api.example", alternatives, credentials)
     settings = ClientSettings.resolve("https://api.example", alternatives, credentials, {"list": ["identity", "key"]})
@@ -129,21 +133,22 @@ def test_token_manager_isolation() -> None:
 
 
 def test_oauth_manager_is_prepared_once_before_transport_construction() -> None:
-    calls = []
+    calls: list[OAuthCredentials] = []
 
     class Provider:
         identity = "application"
 
-        def configure(self, binding):
+        def configure(self, binding: SecurityBinding) -> TokenConfiguration:
             raise AssertionError("Unexpected request configuration")
 
-        async def acquire(self, request):
+        async def acquire(self, request: TokenRequest) -> TokenSet:
             raise AssertionError("Unexpected token acquisition")
 
     provider = Provider()
 
-    def factory(credentials):
+    def factory(credentials: OAuthCredentials) -> Provider:
         calls.append(credentials)
+        assert credentials.endpoints is not None
         assert credentials.endpoints.token_url == "https://api.example/oauth/token"
         return provider
 
@@ -157,7 +162,10 @@ def test_oauth_manager_is_prepared_once_before_transport_construction() -> None:
         provider_factory=factory,
         endpoints=SecurityEndpoints(token_url="oauth/token"),
     )
-    settings = ClientSettings("https://api.example/v1", {"list": [oauth], "read": [oauth]}, {"identity": credentials})
+    settings = ClientSettings.resolve(
+        "https://api.example/v1", {"list": [[oauth]], "read": [[oauth]]}, {"identity": credentials}
+    )
     assert settings.token_manager is not None
     assert len(calls) == 1
+    assert credentials.endpoints is not None
     assert credentials.endpoints.token_url == "oauth/token"
