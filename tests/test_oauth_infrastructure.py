@@ -137,3 +137,78 @@ def test_startup_retains_only_allowlisted_log_diagnostics(tmp_path: Path) -> Non
     assert "secret" not in str(failure.value)
     assert "hidden" not in str(failure.value)
     assert not provider.directory.exists()
+
+
+def test_auto_removed_container_cleanup_is_idempotent(tmp_path: Path) -> None:
+    provider = Provider("live", tmp_path)
+    provider.container = "sunday-owned-fixture"
+    with patch(
+        "subprocess.run",
+        side_effect=[
+            subprocess.CalledProcessError(1, "docker rm"),
+            subprocess.CompletedProcess("docker container ls", 0, stdout=""),
+        ],
+    ) as run:
+        provider.close()
+        provider.close()
+    assert run.call_count == 2
+    assert run.call_args.args[0] == [
+        "docker",
+        "container",
+        "ls",
+        "--all",
+        "--filter",
+        "name=sunday-owned-fixture",
+        "--format",
+        "{{.Names}}",
+    ]
+    assert run.call_args.kwargs["check"] is True
+    assert provider.container is None
+    assert not provider.directory.exists()
+
+
+@pytest.mark.parametrize(
+    "inventory",
+    [
+        subprocess.CompletedProcess("docker container ls", 0, stdout="sunday-owned-fixture\n"),
+        subprocess.CalledProcessError(1, "docker container ls"),
+        subprocess.TimeoutExpired("docker container ls", 20),
+        OSError("Docker unavailable"),
+    ],
+)
+def test_removal_failure_requires_confirmed_absence(tmp_path: Path, inventory: object) -> None:
+    provider = Provider("live", tmp_path)
+    provider.container = "sunday-owned-fixture"
+    with (
+        patch("subprocess.run", side_effect=[subprocess.CalledProcessError(1, "docker rm"), inventory]),
+        pytest.raises(RuntimeError, match="container cleanup failed"),
+    ):
+        provider.close()
+    assert provider.container == "sunday-owned-fixture"
+    assert not provider.directory.exists()
+
+
+def test_auto_removal_preserves_original_startup_failure(tmp_path: Path) -> None:
+    provider = Provider("live", tmp_path)
+    provider.container = "sunday-owned-fixture"
+    process = Mock()
+    process.poll.return_value = 1
+    with (
+        patch.object(provider, "_command", return_value=["synthetic-provider"]),
+        patch("subprocess.Popen", return_value=process),
+        patch(
+            "subprocess.run",
+            side_effect=[
+                subprocess.CalledProcessError(1, "docker rm"),
+                subprocess.CompletedProcess("docker container ls", 0, stdout=""),
+            ],
+        ) as run,
+        pytest.raises(RuntimeError, match="Provider exited before readiness; exit=1") as failure,
+    ):
+        try:
+            provider.start()
+        finally:
+            provider.close()
+    assert "cleanup failed" not in str(failure.value)
+    assert run.call_count == 2
+    assert provider.container is None

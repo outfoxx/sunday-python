@@ -219,6 +219,22 @@ class Provider:
                 time.sleep(0.1)
         raise RuntimeError("Provider readiness timeout")
 
+    def _container_absent(self) -> bool:
+        """Confirm auto-removal through a successful daemon query, never through an error message."""
+        assert self.container is not None
+        try:
+            result = subprocess.run(
+                ["docker", "container", "ls", "--all", "--filter", f"name={self.container}", "--format", "{{.Names}}"],
+                timeout=20,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return self.container not in result.stdout.splitlines()
+
     def close(self) -> None:
         cleanup_failed = False
         try:
@@ -234,7 +250,10 @@ class Provider:
                     )
                     self.container = None
                 except (OSError, subprocess.SubprocessError):
-                    cleanup_failed = True
+                    if self._container_absent():
+                        self.container = None
+                    else:
+                        cleanup_failed = True
             if self.process is not None and self.process.poll() is None:
                 self.process.terminate()
                 try:
