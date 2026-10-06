@@ -11,6 +11,7 @@ Optional adapters must be imported from :mod:`sunday.httpx`,
 
 from importlib.metadata import PackageNotFoundError, version
 
+from .client_settings import ClientSettings
 from .codecs import (
     BinaryCodec,
     FormUrlEncodedCodec,
@@ -21,6 +22,14 @@ from .codecs import (
     MediaTypeEncoders,
     TextCodec,
     WireMode,
+)
+from .credentials import (
+    ApiKeyCredentials,
+    BasicCredentials,
+    BearerCredentials,
+    Credentials,
+    OAuthCredentials,
+    ProviderCredentials,
 )
 from .errors import (
     RequestEncodingError,
@@ -85,9 +94,14 @@ except PackageNotFoundError:  # pragma: no cover - source tree without an editab
 
 __all__ = [
     "UNSET",
+    "ApiKeyCredentials",
     "AuthorizationRequiredError",
     "BaseTransport",
+    "BasicCredentials",
+    "BearerCredentials",
     "BinaryCodec",
+    "ClientSettings",
+    "Credentials",
     "EncodedParameters",
     "EventParser",
     "EventSource",
@@ -113,6 +127,7 @@ __all__ = [
     "MultipartPart",
     "NullableOperation",
     "NullifySpec",
+    "OAuthCredentials",
     "Operation",
     "OperationResponse",
     "OperationSpec",
@@ -126,6 +141,7 @@ __all__ = [
     "ProblemPayload",
     "ProblemRegistrar",
     "ProblemRegistry",
+    "ProviderCredentials",
     "RefreshingTokenProvider",
     "RequestEncodingError",
     "RequestPayloadSpec",
