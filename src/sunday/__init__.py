@@ -72,6 +72,7 @@ from .specs import NullifySpec, OperationSpec, RequestPayloadSpec, RequestSpec, 
 from .sse import EventParser, EventStreamOptions, ServerSentEvent
 from .streaming import StreamingBody, StreamingBodyChunk, StreamingBodyClose, StreamingBodyContent
 from .token_manager import TokenLease, TokenManager
+from .token_manager_factory import TokenManagerFactory
 from .token_provider import (
     AuthorizationRequiredError,
     RefreshingTokenProvider,
@@ -168,6 +169,7 @@ __all__ = [
     "TokenConfiguration",
     "TokenLease",
     "TokenManager",
+    "TokenManagerFactory",
     "TokenProvider",
     "TokenProviderError",
     "TokenRequest",

@@ -285,3 +285,34 @@ normal field validation, including validation during request-mode instance reval
 is a typed, copyable, picklable singleton; it is omitted from JSON Schema and serialization by the
 field configuration above. A literal string `"UNSET"` remains an ordinary string value. Keep the
 `default_factory` and `exclude_if` configuration when defining patch models manually.
+
+## Application-owned token persistence
+
+```python
+settings = ClientSettings.resolve(
+    base_url, alternatives, credentials,
+    token_manager_factory=lambda providers: TokenManager(
+        providers, store=application_store, expiry_skew=30, now=application_clock,
+    ),
+)
+```
+
+The same optional `token_manager_factory: TokenManagerFactory | None` keyword is available on the
+settings initializer. Clock values and expiry skew are seconds. Use the manager on its application's
+asyncio loop. The native manager has no close/reset method: cancel/await application requests and
+discard the manager at session end; it does not own HTTPX clients or close application storage.
+
+The hook is invoked once with the resolved provider map, after security validation, and is skipped
+when no providers are selected. It must only construct a manager: do not acquire tokens or read
+storage in the hook. Omitting it keeps the existing in-memory default. Settings retain the returned
+manager, not the factory. All operations on those settings share it; generated aggregate children
+therefore retain the same cache and single-flight renewal. Independently created managers do not
+coordinate concurrent refreshes, even if their stores are the same. Reuse a client/aggregate within
+an active session; use successive managers to reopen saved sessions.
+
+The application owns persistence, encryption, store access and session boundaries. Provider/client,
+grant, profile and endpoint identities must distinguish environments and users; the API base URL
+alone is not an implicit store namespace. Use a new grant identity for a fresh authorization session.
+For logout, stop requests and wait for pending refresh/persistence to finish before removing the
+session's store entries, then construct fresh settings. `invalidate` expires an access token for
+renewal; it is not logout and deliberately retains refresh state. No disk storage is enabled automatically.

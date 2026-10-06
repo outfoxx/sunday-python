@@ -26,6 +26,7 @@ from .credentials import (
 )
 from .security import SecurityBinding, SecurityEndpoints
 from .token_manager import TokenManager
+from .token_manager_factory import TokenManagerFactory
 from .token_provider import TokenConfiguration, TokenProvider, TokenRequest, TokenSet
 
 
@@ -43,6 +44,8 @@ class ClientSettings:
         base_url: str,
         bindings: Mapping[str, Sequence[SecurityBinding]] | None = None,
         credentials: Mapping[str, Credentials] | None = None,
+        *,
+        token_manager_factory: TokenManagerFactory | None = None,
     ) -> None:
         endpoint = urlsplit(base_url)
         if (
@@ -77,7 +80,7 @@ class ClientSettings:
         object.__setattr__(self, "base_url", base_url)
         object.__setattr__(self, "bindings", MappingProxyType(values))
         object.__setattr__(self, "_credentials", MappingProxyType(supplied))
-        object.__setattr__(self, "token_manager", self._prepare_token_manager())
+        object.__setattr__(self, "token_manager", self._prepare_token_manager(token_manager_factory))
 
     @staticmethod
     def server_url(template: str, variables: Mapping[str, str], document_base_url: str | None = None) -> str:
@@ -104,6 +107,8 @@ class ClientSettings:
         credentials: Mapping[str, Credentials],
         selection: Mapping[str, Sequence[str]] | None = None,
         alternative_selection: Mapping[str, int] | None = None,
+        *,
+        token_manager_factory: TokenManagerFactory | None = None,
     ) -> ClientSettings:
         """Choose complete alternatives; alternative_selection selects a zero-based candidate including scopes."""
         if (set(selection or {}) | set(alternative_selection or {})) - alternatives.keys():
@@ -127,9 +132,9 @@ class ClientSettings:
             if len(usable) != 1:
                 raise ValueError(f"Operation '{operation}' requires one complete security alternative")
             bindings[operation] = usable[0]
-        return cls(base_url, bindings, credentials)
+        return cls(base_url, bindings, credentials, token_manager_factory=token_manager_factory)
 
-    def _prepare_token_manager(self) -> TokenManager | None:
+    def _prepare_token_manager(self, factory: TokenManagerFactory | None) -> TokenManager | None:
         """Prepare providers through the selected transport module without acquiring tokens."""
         owners: dict[str, str] = {}
         providers: dict[str, TokenProvider] = {}
@@ -161,7 +166,9 @@ class ClientSettings:
                     providers[binding.provider] = credential.provider_factory(resolved)
                 else:
                     providers[binding.provider] = _StaticProvider(credential)
-        return TokenManager(providers) if providers else None
+        if not providers:
+            return None
+        return factory(MappingProxyType(providers)) if factory is not None else TokenManager(providers)
 
 
 class _StaticProvider:
