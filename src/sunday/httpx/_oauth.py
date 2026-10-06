@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from time import time
 from typing import Literal
 from urllib.parse import quote_plus
@@ -19,23 +19,11 @@ import httpx
 from authlib.oauth2.auth import ClientAuth  # type: ignore[import-untyped]
 from authlib.oauth2.rfc6749.parameters import prepare_token_request  # type: ignore[import-untyped]
 
+from ..credentials import AuthorizationGrant as AuthorizationGrant
 from ..security import SecurityBinding, SecurityEndpoints
 from ..token_provider import AuthorizationRequiredError, TokenConfiguration, TokenProviderError, TokenRequest, TokenSet
 from ._oauth_wire import DiscoveryMetadata, TokenErrorResponse, TokenSuccessResponse
 from ._oauth_wire import endpoint as _endpoint
-
-
-@dataclass(frozen=True, slots=True)
-class AuthorizationGrant:
-    """Fresh authorization result with an S256 PKCE verifier from the application's browser flow.
-
-    The application checks state, issuer, redirect URI, and the authorization response before handing
-    off this grant. A grant may be exchanged once, including when the exchange fails or is canceled.
-    """
-
-    code: str = field(repr=False)
-    redirect_uri: str
-    code_verifier: str = field(repr=False)
 
 
 class HttpxOAuthTokenProvider:

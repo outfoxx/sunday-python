@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary
 import anyio
 import httpx
 
+from ..client_settings import ClientSettings
 from ..codecs import JsonCodec, MediaTypeDecoders, MediaTypeEncoders
 from ..errors import (
     RequestEncodingError,
@@ -88,6 +89,17 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         self._request_security: WeakKeyDictionary[httpx.Request, RequestSecurity] = WeakKeyDictionary()
         self._closed = False
         self._event_sources: set[HttpxEventSource] = set()
+
+    @classmethod
+    def from_settings(cls, settings: ClientSettings, client: httpx.AsyncClient) -> HttpxTransport:
+        """Use a borrowed application client for API and isolated OAuth requests.
+
+        The client's base URL must match the resolved endpoint. The caller owns its lifetime.
+        For other transport options, pass ``settings.token_manager`` to the normal constructor.
+        """
+        if str(client.base_url).rstrip("/") != str(httpx.URL(settings.base_url)).rstrip("/"):
+            raise ValueError("HTTPX client base URL must match resolved settings")
+        return cls(client, token_manager=settings.token_manager)
 
     def register_problem(self, type_uri: str, problem_type: type[Problem]) -> None:
         """Register a generated problem exception for response decoding."""
