@@ -45,7 +45,14 @@ class ClientSettings:
         credentials: Mapping[str, Credentials] | None = None,
     ) -> None:
         endpoint = urlsplit(base_url)
-        if endpoint.scheme not in {"http", "https"} or not endpoint.hostname:
+        if (
+            endpoint.scheme not in {"http", "https"}
+            or not endpoint.hostname
+            or endpoint.username is not None
+            or endpoint.password is not None
+            or "?" in base_url
+            or "#" in base_url
+        ):
             raise ValueError("Client endpoint must be an absolute HTTP or HTTPS URL")
         values = {
             operation: tuple(
@@ -96,13 +103,19 @@ class ClientSettings:
         alternatives: Mapping[str, Sequence[Sequence[SecurityBinding]]],
         credentials: Mapping[str, Credentials],
         selection: Mapping[str, Sequence[str]] | None = None,
+        alternative_selection: Mapping[str, int] | None = None,
     ) -> ClientSettings:
-        """Choose complete security alternatives, rejecting ambiguous or incomplete credentials."""
+        """Choose complete alternatives; alternative_selection selects a zero-based candidate including scopes."""
+        if (set(selection or {}) | set(alternative_selection or {})) - alternatives.keys():
+            raise ValueError("Unknown operation selection")
         bindings: dict[str, tuple[SecurityBinding, ...]] = {}
         for operation, candidates in alternatives.items():
             selected = (selection or {}).get(operation)
             usable: list[tuple[SecurityBinding, ...]] = []
-            for candidate in candidates:
+            selected_index = (alternative_selection or {}).get(operation)
+            for index, candidate in enumerate(candidates):
+                if selected_index is not None and selected_index != index:
+                    continue
                 if selected is not None and set(selected) != {binding.scheme for binding in candidate}:
                     continue
                 try:

@@ -15,7 +15,11 @@ from .token_provider import TokenProvider, TokenRequest
 
 @dataclass(frozen=True, slots=True)
 class AuthorizationGrant:
-    """Fresh application-authorized PKCE result, consumed once by the OAuth provider."""
+    """Fresh application-authorized PKCE result, consumed once by the OAuth provider.
+
+    The application checks state, issuer, redirect URI, and the authorization response before handing
+    off this grant. A grant may be exchanged once, including when the exchange fails or is canceled.
+    """
 
     code: str = field(repr=False)
     redirect_uri: str

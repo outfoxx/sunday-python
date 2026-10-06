@@ -97,7 +97,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         The client's base URL must match the resolved endpoint. The caller owns its lifetime.
         For other transport options, pass ``settings.token_manager`` to the normal constructor.
         """
-        if str(client.base_url).rstrip("/") != settings.base_url.rstrip("/"):
+        if str(client.base_url).rstrip("/") != str(httpx.URL(settings.base_url)).rstrip("/"):
             raise ValueError("HTTPX client base URL must match resolved settings")
         return cls(client, token_manager=settings.token_manager)
 

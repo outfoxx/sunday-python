@@ -169,3 +169,38 @@ def test_oauth_manager_is_prepared_once_before_transport_construction() -> None:
     assert len(calls) == 1
     assert credentials.endpoints is not None
     assert credentials.endpoints.token_url == "oauth/token"
+
+
+@pytest.mark.parametrize(
+    "url", ["https://user:secret@api.example/v1", "https://api.example/v1?x=1", "https://api.example/v1#part"]
+)
+def test_direct_settings_reject_invalid_endpoints(url: str) -> None:
+    with pytest.raises(ValueError):
+        ClientSettings(url)
+
+
+def test_complete_selection_distinguishes_scopes() -> None:
+    alternatives = {"list": [[replace(BINDING, scopes=("read",))], [replace(BINDING, scopes=("write",))]]}
+    credentials = {"identity": BearerCredentials("token")}
+    with pytest.raises(ValueError):
+        ClientSettings.resolve("https://api.example", alternatives, credentials)
+    settings = ClientSettings.resolve(
+        "https://api.example", alternatives, credentials, alternative_selection={"list": 1}
+    )
+    assert settings.bindings["list"][0].scopes == ("write",)
+    for selection in [{"list": 2}, {"typo": 0}]:
+        with pytest.raises(ValueError):
+            ClientSettings.resolve("https://api.example", alternatives, credentials, alternative_selection=selection)
+
+
+def test_httpx_adapter_normalizes_both_endpoint_urls() -> None:
+    settings = ClientSettings("https://API.Example:443/v1")
+
+    async def check() -> None:
+        async with httpx.AsyncClient(base_url=settings.base_url) as client:
+            assert HttpxTransport.from_settings(settings, client).client is client
+        async with httpx.AsyncClient(base_url="https://api.example/different") as client:
+            with pytest.raises(ValueError):
+                HttpxTransport.from_settings(settings, client)
+
+    asyncio.run(check())
