@@ -71,9 +71,17 @@ def test_container_cleanup_failure_still_terminates_process(tmp_path: Path) -> N
     process = Mock()
     process.poll.return_value = None
     provider.process = process
-    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("docker", 20)):
+    with (
+        patch("subprocess.run", side_effect=subprocess.TimeoutExpired("docker", 20)),
+        pytest.raises(RuntimeError, match="container cleanup failed"),
+    ):
         provider.close()
-    process.terminate.assert_called_once()
+    assert provider.container == "sunday-owned-fixture"
+    with patch("subprocess.run") as removal:
+        provider.close()
+    removal.assert_called_once()
+    assert provider.container is None
+    process.terminate.assert_called()
     assert not provider.directory.exists()
 
 
@@ -116,3 +124,16 @@ def test_bad_download_removes_partial_artifact(tmp_path: Path) -> None:
     with patch("httpx.stream", return_value=stream), pytest.raises(RuntimeError, match="integrity"):
         artifact(tmp_path, "https://example.invalid/provider.jar", "invalid")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_startup_retains_only_allowlisted_log_diagnostics(tmp_path: Path) -> None:
+    provider = Provider("replay", tmp_path)
+    (provider.directory / "provider.log").write_text("private-secret Address already in use password=hidden")
+    with (
+        patch.object(provider, "_command", side_effect=RuntimeError("synthetic-secret")),
+        pytest.raises(RuntimeError, match="provider preparation failed; diagnostics=Address already in use") as failure,
+    ):
+        provider.start()
+    assert "secret" not in str(failure.value)
+    assert "hidden" not in str(failure.value)
+    assert not provider.directory.exists()

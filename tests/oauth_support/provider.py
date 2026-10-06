@@ -13,7 +13,6 @@ import tarfile
 import tempfile
 import time
 import uuid
-from contextlib import suppress
 from pathlib import Path
 from typing import BinaryIO
 
@@ -69,6 +68,7 @@ class Provider:
         self.backend = backend(mode, platform.system(), os.environ.get("CI"))
         self.cache = cache
         self.startup_timeout = startup_timeout
+        self.stage = "provider preparation"
         self.realm = "sunday-" + uuid.uuid4().hex
         self.directory = Path(tempfile.mkdtemp(prefix="sunday-oauth-"))
         self.process: subprocess.Popen[bytes] | None = None
@@ -83,18 +83,54 @@ class Provider:
         self.callback = "http://127.0.0.1:49173/callback"
 
     def start(self) -> Provider:
+        self.stage = "provider preparation"
         try:
             command = self._command()
             self.log = (self.directory / "provider.log").open("wb")
+            self.stage = "process launch"
             self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT)
+            self.stage = "readiness"
             self._ready()
             return self
-        except Exception:
-            self.close()
-            raise RuntimeError(f"OAuth infrastructure startup failed ({self.backend})") from None
+        except Exception as failure:
+            # Never retain arbitrary exception text or provider logs: either can contain credentials.
+            safe_reasons = {
+                "OAuth artifact cache integrity failure",
+                "OAuth artifact download integrity failure",
+                "Provider exited before readiness",
+                "Provider readiness timeout",
+            }
+            reason = str(failure) if str(failure) in safe_reasons else f"{self.stage} failed"
+            if self.process is not None and (code := self.process.poll()) is not None:
+                reason += f"; exit={code}"
+            reason += self._diagnostics()
+            try:
+                self.close()
+            except RuntimeError:
+                reason += "; container cleanup failed"
+            raise RuntimeError(f"OAuth infrastructure startup failed ({self.backend}): {reason}") from None
+
+    def _diagnostics(self) -> str:
+        # Recognized phrases are safe; even a redacted whole log line could retain arbitrary secrets.
+        phrases = (
+            "Address already in use",
+            "UnsupportedClassVersionError",
+            "Unable to access jarfile",
+            "Could not find or load main class",
+            "Permission denied",
+            "No such file or directory",
+        )
+        try:
+            with (self.directory / "provider.log").open("rb") as log:
+                text = log.read(8192).decode("utf-8", errors="replace").lower()
+        except OSError:
+            return ""
+        recognized = [phrase for phrase in phrases if phrase.lower() in text]
+        return "; diagnostics=" + ", ".join(recognized) if recognized else ""
 
     def _command(self) -> list[str]:
         if self.backend == "wiremock-java":
+            self.stage = "artifact retrieval"
             jar = artifact(self.cache, WIREMOCK_URL, WIREMOCK_SHA)
             return ["java", "-jar", str(jar), "--bind-address", "127.0.0.1", "--port", str(self.port)]
         realm = self._realm()
@@ -103,7 +139,9 @@ class Provider:
         (imports / f"{self.realm}-realm.json").write_text(json.dumps(realm))
         options = ["start-dev", "--import-realm", "--http-port", str(self.port), "--hostname", self.base]
         if self.backend == "keycloak-java":
+            self.stage = "artifact retrieval"
             archive = artifact(self.cache, KEYCLOAK_URL, KEYCLOAK_SHA)
+            self.stage = "archive extraction"
             with tarfile.open(archive) as bundle:
                 bundle.extractall(self.directory, filter="data")
             distribution = self.directory / "keycloak-26.2.5"
@@ -182,17 +220,21 @@ class Provider:
         raise RuntimeError("Provider readiness timeout")
 
     def close(self) -> None:
+        cleanup_failed = False
         try:
             if self.container is not None:
-                # Docker failure must not prevent cleanup of the owned CLI process and directory.
-                with suppress(OSError, subprocess.SubprocessError):
+                # Retain the container identity for a retry, but always finish local cleanup.
+                try:
                     subprocess.run(
                         ["docker", "rm", "-f", self.container],
                         timeout=20,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
-                        check=False,
+                        check=True,
                     )
+                    self.container = None
+                except (OSError, subprocess.SubprocessError):
+                    cleanup_failed = True
             if self.process is not None and self.process.poll() is None:
                 self.process.terminate()
                 try:
@@ -204,3 +246,5 @@ class Provider:
             if self.log is not None:
                 self.log.close()
             shutil.rmtree(self.directory, ignore_errors=True)
+        if cleanup_failed:
+            raise RuntimeError(f"OAuth infrastructure container cleanup failed ({self.backend}); retry close")

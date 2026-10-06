@@ -6,6 +6,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -28,19 +29,19 @@ def endpoint(value: str | None) -> httpx.URL:
 
 
 def _document(body: str) -> dict[str, Any]:
-    value = json.loads(body)
+    value = json.loads(body, parse_float=Decimal)
     if not isinstance(value, dict):
         raise TokenProviderError()
     return value
 
 
-def _string(data: dict[str, Any], name: str, *, required: bool = False) -> str | None:
+def _string(data: dict[str, Any], name: str, *, required: bool = False, allow_empty: bool = False) -> str | None:
     if name not in data:
         if required:
             raise TokenProviderError()
         return None
     value = data[name]
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or (not allow_empty and not value):
         raise TokenProviderError()
     return value
 
@@ -80,7 +81,7 @@ class DiscoveryMetadata:
 class TokenSuccessResponse:
     access_token: str
     token_type: str
-    expires_in: int | float | None
+    expires_in: int | None
     refresh_token: str | None
     scope: str | None
 
@@ -93,8 +94,9 @@ class TokenSuccessResponse:
         lifetime = None
         if "expires_in" in data:
             lifetime = data["expires_in"]
-            if type(lifetime) not in {int, float} or not math.isfinite(lifetime) or lifetime != math.floor(lifetime):
+            if type(lifetime) not in {int, Decimal} or not math.isfinite(lifetime) or lifetime != math.floor(lifetime):
                 raise TokenProviderError()
+            lifetime = int(lifetime)
         scope = _string(data, "scope")
         if scope is not None and not _SCOPE.fullmatch(scope):
             raise TokenProviderError()
@@ -123,6 +125,6 @@ class TokenErrorResponse:
         data = _document(body)
         code = _string(data, "error", required=True)
         assert code is not None
-        _string(data, "error_description")
+        _string(data, "error_description", allow_empty=True)
         _string(data, "error_uri")
         return cls(code)

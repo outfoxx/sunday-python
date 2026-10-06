@@ -122,7 +122,7 @@ async def test_pkce_consumes_authorization_once_and_invalid_refresh_requires_new
                 },
             )
         assert "code" not in form and "code_verifier" not in form
-        return httpx.Response(400, json={"error": "invalid_grant", "error_description": "SECRET"})
+        return httpx.Response(400, json={"error": "invalid_grant", "error_description": ""})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
         provider = HttpxOAuthTokenProvider(
