@@ -28,7 +28,11 @@ class RequestPayloadSpec[RequestBodyT]:
 
 @dataclass(frozen=True, slots=True)
 class RequestSpec[RequestBodyT]:
-    """Declarative HTTP request description consumed by a transport."""
+    """Declarative HTTP request description consumed by a transport.
+
+    ``binary_accept_types`` identifies response media types that need no media
+    decoder. ``OperationSpec`` populates it from binary response declarations.
+    """
 
     method: str
     path_template: str | URITemplate
@@ -42,6 +46,7 @@ class RequestSpec[RequestBodyT]:
     template_parameters: Mapping[str, object | None] = field(default_factory=dict)
     body_adapter: TypeAdapter[Any] | None = None
     parameter_validation: Callable[[], None] | None = None
+    binary_accept_types: tuple[MediaType, ...] = ()
 
     def __post_init__(self) -> None:
         if self.payload is not None and (self.body is not None or self.content_types):
@@ -85,13 +90,19 @@ class ResponseHeaderSpec:
 
 @dataclass(frozen=True, slots=True)
 class ResponseSpec[ResponseT]:
-    """Expected response status, media types, and generated value decoder."""
+    """Expected response status, media types, and generated value decoder.
+
+    ``binary_body`` passes the complete body bytes to the value decoder without
+    media decoding, including empty bodies. Use it for whole-body binary schemas,
+    not encoded byte properties within structured responses.
+    """
 
     status: int | None
     content_types: tuple[MediaType, ...] = ()
     decoder: Callable[[object], ResponseT] | None = None
     body_expected: bool = True
     headers: tuple[ResponseHeaderSpec, ...] = ()
+    binary_body: bool = False
 
     def accepts(self, media_type: MediaType | None) -> bool:
         """Return whether this response specification accepts ``media_type``."""
@@ -102,10 +113,24 @@ class ResponseSpec[ResponseT]:
 
 @dataclass(frozen=True, slots=True)
 class OperationSpec[RequestBodyT, ResponseT]:
-    """A generated request and the possible successful responses."""
+    """A generated request and the possible successful responses.
+
+    Binary response media types are carried into request negotiation so they do
+    not require a registered media decoder.
+    """
 
     request: RequestSpec[RequestBodyT]
     responses: tuple[ResponseSpec[ResponseT], ...]
+
+    def __post_init__(self) -> None:
+        binary_types = tuple(
+            media
+            for response in self.responses
+            if response.binary_body
+            for media in response.content_types or (MediaType("*/*"),)
+        )
+        if self.request.binary_accept_types != binary_types:
+            object.__setattr__(self, "request", replace(self.request, binary_accept_types=binary_types))
 
 
 @dataclass(frozen=True, slots=True)

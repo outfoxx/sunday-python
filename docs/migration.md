@@ -32,3 +32,22 @@ requests, including when the transport borrows a configured client.
 
 Leaving `retry_max` unset now selects the cross-runtime dynamic cap of 30 times the current retry interval instead of a
 fixed 15-second cap. Explicit positive client caps and positive server `retry-max:` controls remain supported.
+
+## Whole-body binary responses
+
+Declare whole-body binary results with `ResponseSpec(binary_body=True)`. The transport still checks the declared status
+and media types, then supplies the body bytes directly to the result decoder. This preserves JSON and non-UTF-8 text
+assets as bytes and accepts empty binary bodies as `b""`. Bodyless 204/205 responses retain their existing semantics.
+`OperationSpec` also carries binary response media types into request Accept negotiation; no catch-all codec is needed.
+
+```python
+ResponseSpec(
+    status=200,
+    content_types=(MediaType("application/octet-stream"), MediaType("*/*")),
+    decoder=TypeAdapter(bytes).validate_python,
+    binary_body=True,
+)
+```
+
+Generated clients must be regenerated with a generator that emits this flag. Older generated clients retain their
+existing media-decoding behavior. Encoded byte properties inside JSON models continue to use normal model decoding.
