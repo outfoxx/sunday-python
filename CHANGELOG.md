@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Preserve whole-body binary responses with `ResponseSpec(binary_body=True)`, including empty bodies, JSON/text assets,
+  and arbitrary media types. Binary response declarations also participate in request Accept negotiation.
+
 - Allow public OAuth PKCE acquisition and refresh when discovery omits `none`, including Keycloak metadata, while
   retaining confidential-client authentication checks and rejecting malformed authentication-method arrays.
 

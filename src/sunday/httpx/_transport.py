@@ -164,7 +164,10 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             headers["cookie"] = f"{existing_cookie}; {cookie_value}" if existing_cookie else cookie_value
         if spec.accept_types and "accept" not in headers:
             supported = tuple(
-                media_type for media_type in spec.accept_types if self.decoders.find(media_type) is not None
+                media_type
+                for media_type in spec.accept_types
+                if self.decoders.find(media_type) is not None
+                or any(binary.matches(media_type) for binary in spec.binary_accept_types)
             )
             if not supported:
                 declared = ", ".join(str(media_type) for media_type in spec.accept_types)
@@ -408,24 +411,26 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         if not candidates:
             raise self._unexpected(response, body, "No response specification accepts this status")
 
-        if response.status_code in {204, 205} or not body:
+        response_spec = next((item for item in candidates if item.accepts(content_type)), None)
+        if response.status_code in {204, 205} or (
+            not body and (response_spec is None or not response_spec.binary_body)
+        ):
             response_spec = next((item for item in candidates if not item.body_expected), None)
             if response_spec is None and response.status_code not in {204, 205}:
                 raise self._unexpected(response, body, "Expected a response body")
             decoded_headers = self._decode_headers(response_spec, headers, response, body) if response_spec else {}
             return OperationResponse(None, response, response.status_code, headers, decoded_headers)
 
-        response_spec = next((item for item in candidates if item.accepts(content_type)), None)
         if response_spec is None:
             raise self._unexpected(response, body, "No response specification accepts this media type")
         if content_type is None:
             raise self._unexpected(response, body, "A response body was returned without Content-Type")
 
-        decoder = self.decoders.find(content_type)
-        if decoder is None:
+        decoder = None if response_spec.binary_body else self.decoders.find(content_type)
+        if decoder is None and not response_spec.binary_body:
             raise self._unexpected(response, body, "No decoder supports the response media type")
         try:
-            decoded = decoder.decode(body, content_type)
+            decoded = decoder.decode(body, content_type) if decoder is not None else body
             result = response_spec.decoder(decoded) if response_spec.decoder is not None else decoded
         except (TypeError, ValueError) as error:
             raise ResponseDecodingError(
