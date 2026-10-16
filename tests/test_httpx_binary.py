@@ -11,9 +11,11 @@ from pydantic import Base64Bytes, TypeAdapter
 
 from sunday import (
     MediaType,
+    MediaTypeDecoders,
     Operation,
     OperationSpec,
     Problem,
+    RequestEncodingError,
     RequestSpec,
     ResponseHeaderSpec,
     ResponseSpec,
@@ -184,3 +186,52 @@ def test_operation_updates_binary_negotiation_when_responses_are_replaced() -> N
     assert request.binary_accept_types == ()
     structured = replace(operation, responses=(ResponseSpec(200),))
     assert structured.request.binary_accept_types == ()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("accept", "declared", "actual", "overlaps"),
+    [
+        ("image/*", "image/png", "image/png", True),
+        ("*/*", "image/png", "image/png", True),
+        ("image/png", "image/*", "image/png", True),
+        ("image/png", "*/*", "image/png", True),
+        ("image/*", "image/*", "image/png", True),
+        ("application/*+json", "application/vnd.asset+json", "application/vnd.asset+json", True),
+        ("application/vnd.asset+json", "application/*+json", "application/vnd.asset+json", True),
+        ("application/*", "application/*+json", "application/vnd.asset+json", True),
+        ("application/*+json", "application/*", "application/vnd.asset+json", True),
+        ("image/*", "audio/mpeg", "audio/mpeg", False),
+        ("image/png", "image/jpeg", "image/jpeg", False),
+        ("application/*+json", "application/*+xml", "application/vnd.asset+xml", False),
+    ],
+)
+async def test_binary_accept_negotiation_matches_overlapping_ranges(
+    accept: str, declared: str, actual: str, overlaps: bool
+) -> None:
+    requests = 0
+    body = b"\x00\xff"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        assert request.headers["Accept"] == accept
+        return httpx.Response(200, content=body, headers={"Content-Type": actual})
+
+    async with httpx.AsyncClient(base_url="https://example.test", transport=httpx.MockTransport(handler)) as client:
+        operation: Operation[bytes, httpx.Request, httpx.Response] = Operation(
+            HttpxTransport(client, decoders=MediaTypeDecoders()),
+            OperationSpec(
+                RequestSpec("GET", "/asset", accept_types=(MediaType(accept),)),
+                (ResponseSpec(200, (MediaType(declared),), TypeAdapter(bytes).validate_python, binary_body=True),),
+            ),
+        )
+        if overlaps:
+            assert await operation.execute() == body
+            assert (await operation.response()).result == body
+            assert requests == 2
+        else:
+            for call in (operation.execute, operation.response):
+                with pytest.raises(RequestEncodingError, match="No response decoder"):
+                    await call()
+            assert requests == 0

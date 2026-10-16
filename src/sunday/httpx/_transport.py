@@ -167,7 +167,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                 media_type
                 for media_type in spec.accept_types
                 if self.decoders.find(media_type) is not None
-                or any(binary.matches(media_type) for binary in spec.binary_accept_types)
+                or any(binary.matches(media_type) or media_type.matches(binary) for binary in spec.binary_accept_types)
             )
             if not supported:
                 declared = ", ".join(str(media_type) for media_type in spec.accept_types)
