@@ -39,7 +39,7 @@ class ProblemPayload(SundayModel):
         """
         if not isinstance(value, Mapping):
             return value
-        normalized = dict(value)
+        normalized = value.copy() if isinstance(value, dict) else dict(value)
         for name in ("type", "title", "status", "detail", "instance"):
             keys = cls.standard_member_input_keys(name)
             for key in keys:
@@ -51,9 +51,11 @@ class ProblemPayload(SundayModel):
                     if name == "status"
                     else isinstance(member, str)
                 )
-                if not valid:
-                    del normalized[key]
-            if name == "type" and not any(key in normalized for key in keys):
+                if valid:
+                    # Lower-priority names are extras once Pydantic selects this key.
+                    break
+                del normalized[key]
+            if name == "type" and keys and not any(key in normalized for key in keys):
                 # An inherited custom default must not turn an absent type into
                 # a custom discriminator. Its constraints still validate blank.
                 normalized[keys[0]] = "about:blank"
@@ -62,9 +64,27 @@ class ProblemPayload(SundayModel):
     @classmethod
     def standard_member_input_keys(cls, name: str) -> list[str]:
         """Return accepted input keys in Pydantic alias precedence order."""
-        alias = cls.model_fields[name].validation_alias
+        field = cls.model_fields[name]
+        alias = field.validation_alias
         aliases = alias.choices if isinstance(alias, AliasChoices) else [alias]
-        return list(dict.fromkeys([key for key in aliases if isinstance(key, str)] + [name]))
+        by_alias = cls.model_config.get("validate_by_alias", True)
+        by_name = cls.model_config.get("validate_by_name", cls.model_config.get("populate_by_name", False))
+        keys = [key for key in aliases if isinstance(key, str)] if by_alias else []
+        if alias is None or by_name:
+            extension_aliases = {
+                key
+                for field_name, extension in cls.model_fields.items()
+                if field_name not in ("type", "title", "status", "detail", "instance")
+                for key in (
+                    extension.validation_alias.choices
+                    if isinstance(extension.validation_alias, AliasChoices)
+                    else [extension.validation_alias]
+                )
+                if by_alias and isinstance(key, str)
+            }
+            if name not in extension_aliases:
+                keys.append(name)
+        return list(dict.fromkeys(keys))
 
 
 class Problem(Exception):

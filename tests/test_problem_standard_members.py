@@ -6,7 +6,7 @@ from copy import deepcopy
 from typing import Literal
 
 import pytest
-from pydantic import Field, TypeAdapter, ValidationError
+from pydantic import ConfigDict, Field, TypeAdapter, ValidationError
 
 from sunday import Problem, ProblemPayload, ProblemRegistry, SundayModel
 
@@ -106,3 +106,57 @@ def test_transport_status_precedes_model_defaults_and_uses_aliases() -> None:
     assert registry.decode({"httpStatus": 404, "summary": ""}, response_status=409).title == ""
     assert registry.decode({"httpStatus": 404}, response_status=409).title == "Not Found"
     assert registry.decode({}).status == 400
+
+
+def test_aliases_do_not_consume_extension_values() -> None:
+    class AliasedPayload(ProblemPayload):
+        detail: str | None = Field(default=None, alias="explanation")
+        extension_detail: int = Field(alias="detail")
+
+    raw = {"explanation": "shown", "detail": 42}
+    value = AliasedPayload.model_validate(raw)
+    assert value.detail == "shown"
+    assert value.extension_detail == 42
+    assert raw == {"explanation": "shown", "detail": 42}
+
+    class AliasOnlyPayload(ProblemPayload):
+        model_config = ConfigDict(validate_by_alias=True, validate_by_name=False)
+        detail: str | None = Field(default=None, alias="explanation")
+
+    value_with_extra = AliasOnlyPayload.model_validate({"explanation": "shown", "detail": None})
+    assert value_with_extra.detail == "shown"
+    assert value_with_extra.model_extra == {"detail": None}
+
+
+def test_existing_aliased_payload_revalidates_by_name() -> None:
+    class AliasedPayload(ProblemPayload):
+        trace_id: str = Field(alias="traceId")
+        note: str = Field(default="fallback", alias="wireNote")
+
+    original = AliasedPayload.model_validate({"traceId": "trace", "wireNote": "kept", "extra": None})
+    presence = original.model_fields_set.copy()
+    for value in (
+        AliasedPayload.model_validate(original, by_alias=False, by_name=True),
+        TypeAdapter(AliasedPayload).validate_python(original, by_alias=False, by_name=True),
+    ):
+        assert value == original
+        assert value.model_fields_set == presence
+    assert original.model_fields_set == presence
+
+
+def test_transport_defaults_use_enabled_validation_names() -> None:
+    class NameOnlyPayload(ProblemPayload):
+        model_config = ConfigDict(validate_by_alias=False, validate_by_name=True)
+        status: int | None = Field(default=None, alias="httpStatus")
+        title: str | None = Field(default=None, alias="summary")
+
+    class NameOnlyProblem(Problem):
+        payload_type = NameOnlyPayload
+
+    registry = ProblemRegistry()
+    registry.register("about:blank", NameOnlyProblem)
+    value = registry.decode({}, response_status=409)
+    assert value.status == 409
+    assert value.title == "Conflict"
+    assert value.payload.model_extra == {}
+    assert registry.decode({"status": "404"}, response_status=409).status == 409
