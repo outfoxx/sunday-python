@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from http import HTTPStatus
 from typing import Any, ClassVar, Self
 
-from pydantic import ConfigDict, Field
+from pydantic import AliasChoices, ConfigDict, Field, model_validator
 
 from .models import SundayModel
 
@@ -23,6 +24,47 @@ class ProblemPayload(SundayModel):
     status: int | None = Field(default=None, exclude_if=lambda value: value is None)
     detail: str | None = Field(default=None, exclude_if=lambda value: value is None)
     instance: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_standard_members(cls, value: Any) -> Any:
+        return cls.normalize_standard_members(value)
+
+    @classmethod
+    def normalize_standard_members(cls, value: Any) -> Any:
+        """Discard wrong JSON categories before defaults and field validation.
+
+        Only standard members are normalized; extension values and nested models
+        retain their authored validation rules. Work on a copy for shared inputs.
+        """
+        if not isinstance(value, Mapping):
+            return value
+        normalized = dict(value)
+        for name in ("type", "title", "status", "detail", "instance"):
+            keys = cls.standard_member_input_keys(name)
+            for key in keys:
+                if key not in normalized:
+                    continue
+                member = normalized[key]
+                valid = (
+                    isinstance(member, (int, float)) and not isinstance(member, bool)
+                    if name == "status"
+                    else isinstance(member, str)
+                )
+                if not valid:
+                    del normalized[key]
+            if name == "type" and not any(key in normalized for key in keys):
+                # An inherited custom default must not turn an absent type into
+                # a custom discriminator. Its constraints still validate blank.
+                normalized[keys[0]] = "about:blank"
+        return normalized
+
+    @classmethod
+    def standard_member_input_keys(cls, name: str) -> list[str]:
+        """Return accepted input keys in Pydantic alias precedence order."""
+        alias = cls.model_fields[name].validation_alias
+        aliases = alias.choices if isinstance(alias, AliasChoices) else [alias]
+        return list(dict.fromkeys([key for key in aliases if isinstance(key, str)] + [name]))
 
 
 class Problem(Exception):
@@ -87,11 +129,26 @@ class ProblemRegistry:
 
     def decode(self, value: Mapping[str, object], *, response_status: int | None = None) -> Problem:
         """Decode a problem mapping, falling back to the base problem type."""
-        type_uri = value.get("type", "about:blank")
-        problem_type = self._problem_types.get(type_uri, Problem) if isinstance(type_uri, str) else Problem
-        payload = problem_type.payload_type.model_validate(value)
-        if payload.status is None and response_status is not None:
-            payload = payload.model_copy(update={"status": response_status})
+        type_uri = value.get("type")
+        if not isinstance(type_uri, str):
+            type_uri = "about:blank"
+        problem_type = self._problem_types.get(type_uri, Problem)
+        payload_type = problem_type.payload_type
+        normalized = payload_type.normalize_standard_members(value)
+        if response_status is not None:
+            status_keys = payload_type.standard_member_input_keys("status")
+            status = next((normalized[key] for key in status_keys if key in normalized), response_status)
+            if not any(key in normalized for key in status_keys):
+                normalized[status_keys[0]] = response_status
+            title_keys = payload_type.standard_member_input_keys("title")
+            if type_uri == "about:blank" and not any(key in normalized for key in title_keys):
+                try:
+                    title = HTTPStatus(status).phrase
+                except ValueError:
+                    pass
+                else:
+                    normalized[title_keys[0]] = title
+        payload = payload_type.model_validate(normalized)
         return problem_type(payload)
 
     def copy(self) -> ProblemRegistry:

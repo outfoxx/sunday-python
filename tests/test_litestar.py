@@ -157,7 +157,7 @@ def test_problem_response_preserves_nullable_extension_fields() -> None:
 
     @get("/nullable-problem")
     async def nullable_problem() -> None:
-        raise Problem(NullableProblemPayload(status=400, required_nullable=None))
+        raise Problem(NullableProblemPayload.model_validate({"status": 400, "requiredNullable": None, "detail": []}))
 
     with TestClient(Litestar(route_handlers=[nullable_problem], plugins=[SundayPlugin()])) as client:
         response = client.get("/nullable-problem")
