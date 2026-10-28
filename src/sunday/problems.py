@@ -6,15 +6,27 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import suppress
+from http import HTTPStatus
 from typing import Any, ClassVar, Self
 
-from pydantic import ConfigDict, Field
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from .models import SundayModel
 
+_STANDARD_MEMBERS = frozenset({"type", "title", "status", "detail", "instance"})
+
 
 class ProblemPayload(SundayModel):
-    """RFC 9457 problem details payload with extension-member preservation."""
+    """RFC 9457 payload with fixed standard wire names and authored extensions."""
 
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True, extra="allow")
 
@@ -23,6 +35,71 @@ class ProblemPayload(SundayModel):
     status: int | None = Field(default=None, exclude_if=lambda value: value is None)
     detail: str | None = Field(default=None, exclude_if=lambda value: value is None)
     instance: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        """Reserve the RFC wire names while leaving extension aliases to Pydantic."""
+        super().__pydantic_init_subclass__(**kwargs)
+        for name, field in cls.model_fields.items():
+            if name in _STANDARD_MEMBERS:
+                if any(
+                    alias is not None and alias != name
+                    for alias in (field.alias, field.validation_alias, field.serialization_alias)
+                ):
+                    raise TypeError(f"Problem standard member {name!r} must use its RFC wire name")
+                continue
+            alias = field.validation_alias
+            paths = (
+                alias.convert_to_aliases()
+                if isinstance(alias, AliasChoices)
+                else [alias.path]
+                if isinstance(alias, AliasPath)
+                else [[alias]]
+                if isinstance(alias, str)
+                else []
+            )
+            names = {name, field.alias, field.serialization_alias, *(path[0] for path in paths)}
+            if names & _STANDARD_MEMBERS:
+                raise TypeError(f"Problem extension {name!r} cannot use a reserved RFC member name")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_standard_members(cls, value: Any) -> Any:
+        return cls.normalize_standard_members(value)
+
+    @classmethod
+    def normalize_standard_members(cls, value: Any) -> Any:
+        """Copy JSON input, discard wrong standard types, and supply the effective type.
+
+        Generated union dispatch uses this same function before choosing a subtype.
+        Correctly typed values, extensions, and nested contents remain untouched.
+        """
+        if not isinstance(value, Mapping):
+            return value
+        normalized = value.copy() if isinstance(value, dict) else dict(value)
+        for name in _STANDARD_MEMBERS:
+            if name not in normalized:
+                continue
+            member = normalized[name]
+            valid = (
+                isinstance(member, (int, float)) and not isinstance(member, bool)
+                if name == "status"
+                else isinstance(member, str)
+            )
+            if not valid:
+                del normalized[name]
+        normalized.setdefault("type", "about:blank")
+        return normalized
+
+    @model_serializer(mode="wrap")
+    def _serialize_standard_members(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        # A return annotation replaces Pydantic's model JSON schema with that type's schema.
+        # Redeclaring a field can replace its exclude_if; keep RFC omission on subclasses.
+        result: dict[str, Any] = handler(self)
+        for name in _STANDARD_MEMBERS:
+            if result.get(name) is None:
+                result.pop(name, None)
+        return result
 
 
 class Problem(Exception):
@@ -87,11 +164,18 @@ class ProblemRegistry:
 
     def decode(self, value: Mapping[str, object], *, response_status: int | None = None) -> Problem:
         """Decode a problem mapping, falling back to the base problem type."""
-        type_uri = value.get("type", "about:blank")
-        problem_type = self._problem_types.get(type_uri, Problem) if isinstance(type_uri, str) else Problem
-        payload = problem_type.payload_type.model_validate(value)
-        if payload.status is None and response_status is not None:
-            payload = payload.model_copy(update={"status": response_status})
+        type_uri = value.get("type")
+        if not isinstance(type_uri, str):
+            type_uri = "about:blank"
+        problem_type = self._problem_types.get(type_uri, Problem)
+        payload_type = problem_type.payload_type
+        normalized = payload_type.normalize_standard_members(value)
+        if response_status is not None:
+            normalized.setdefault("status", response_status)
+            if type_uri == "about:blank" and "title" not in normalized:
+                with suppress(ValueError):
+                    normalized["title"] = HTTPStatus(normalized["status"]).phrase
+        payload = payload_type.model_validate(normalized)
         return problem_type(payload)
 
     def copy(self) -> ProblemRegistry:
