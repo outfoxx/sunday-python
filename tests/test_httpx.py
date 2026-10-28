@@ -402,6 +402,8 @@ async def test_typed_problem_decoding_and_generic_fallback() -> None:
                 "type": "https://example.test/problems/conflict",
                 "title": "Conflict",
                 "conflicting_id": "project-1",
+                "detail": 42,
+                "status": "401",
             },
         ),
         httpx.Response(
@@ -427,6 +429,7 @@ async def test_typed_problem_decoding_and_generic_fallback() -> None:
         with pytest.raises(ConflictProblem) as conflict:
             await operation.execute()
         assert conflict.value.status == 409
+        assert conflict.value.detail is None
         assert conflict.value.payload.conflicting_id == "project-1"  # type: ignore[attr-defined]
 
         with pytest.raises(Problem) as unknown:
