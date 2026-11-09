@@ -1415,3 +1415,137 @@ async def test_retiring_event_source_can_request_transport_shutdown(server: Serv
         finally:
             proceed.set()
             await transport.aclose()
+
+
+@pytest.mark.parametrize("child_callback", [False, True])
+@pytest.mark.parametrize("close_target", ["stream", "response"])
+@pytest.mark.parametrize("failure_kind", ["none", "stop", "error", "cancellation"])
+async def test_early_exit_cleanup_can_reenter_close_without_releasing_external_waiters(
+    server: Server, child_callback: bool, close_target: str, failure_kind: str
+) -> None:
+    from sunday.httpx._response_cleanup import close_response
+
+    reentered, release = anyio.Event(), anyio.Event()
+    responses: list[httpx.Response] = []
+    cancellations: list[asyncio.CancelledError] = []
+    original = {
+        "stop": Stop("original consumer stop"),
+        "error": ValueError("original consumer error"),
+        "cancellation": asyncio.CancelledError("original consumer cancellation"),
+    }.get(failure_kind)
+    closes = 0
+
+    async def trace(name: str, info: dict[str, Any]) -> None:
+        nonlocal closes
+        if name == "http11.response_closed.started":
+            closes += 1
+            close = stream.aclose() if close_target == "stream" else close_response(responses[0])
+            if child_callback:
+                await asyncio.create_task(close)
+            else:
+                await close
+            reentered.set()
+            await release.wait()
+
+    async def adapt_request(request: httpx.Request) -> httpx.Request:
+        request.extensions["trace"] = trace
+        return request
+
+    async def adapt_response(response: httpx.Response, request: httpx.Request) -> httpx.Response:
+        responses.append(response)
+        return response
+
+    async with httpx.AsyncClient(
+        base_url=server.url, trust_env=False, limits=httpx.Limits(max_connections=1), timeout=1
+    ) as client:
+        stream = HttpxTransport(client, request_adapter=adapt_request, response_adapter=adapt_response).event_stream(
+            RequestSpec("GET", "/events"), lambda event: event.data
+        )
+
+        async def consume() -> None:
+            async with stream:
+                async for event in stream:
+                    assert event == "first"
+                    if original is not None:
+                        raise original
+                    break
+
+        async def close_externally() -> None:
+            try:
+                await stream.aclose()
+            except asyncio.CancelledError as error:
+                cancellations.append(error)
+                raise
+
+        consumer = asyncio.create_task(consume())
+        closers: list[asyncio.Task[None]] = []
+        try:
+            with anyio.fail_after(3):
+                await reentered.wait()
+                assert stream._active_io is None
+                assert stream._response is responses[0]
+                closers = [asyncio.create_task(close_externally()), asyncio.create_task(stream.aclose())]
+                await anyio.sleep(0)
+                closers[0].cancel("first external close cancellation")
+                await anyio.sleep(0)
+                closers[0].cancel("later external close cancellation")
+                await anyio.sleep(0)
+                assert all(not task.done() for task in [consumer, *closers])
+                assert stream._response is responses[0]
+                release.set()
+                if original is None:
+                    await consumer
+                else:
+                    with pytest.raises(type(original)) as failure:
+                        await consumer
+                    assert failure.value is original
+                with pytest.raises(asyncio.CancelledError) as failure:
+                    await closers[0]
+                assert failure.value is cancellations[0]
+                assert failure.value.args == ("first external close cancellation",)
+                await closers[1]
+                assert closes == 1
+                assert stream._response is None
+                await server.disconnected.wait()
+                assert (await client.get("/after")).status_code == 204
+        finally:
+            release.set()
+            await asyncio.gather(consumer, *closers, return_exceptions=True)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("child_callback", [False, True])
+async def test_eof_cleanup_can_reenter_response_close(server: Server, streaming: bool, child_callback: bool) -> None:
+    from sunday.httpx._response_cleanup import close_response
+
+    responses: list[httpx.Response] = []
+    closes = 0
+
+    async def trace(name: str, info: dict[str, Any]) -> None:
+        nonlocal closes
+        if name == "http11.response_closed.started":
+            closes += 1
+            close = close_response(responses[0])
+            if child_callback:
+                await asyncio.create_task(close)
+            else:
+                await close
+
+    async def adapt_request(request: httpx.Request) -> httpx.Request:
+        request.extensions["trace"] = trace
+        return request
+
+    async def adapt_response(response: httpx.Response, request: httpx.Request) -> httpx.Response:
+        responses.append(response)
+        return response
+
+    async with httpx.AsyncClient(
+        base_url=server.url, trust_env=False, limits=httpx.Limits(max_connections=1), timeout=1
+    ) as client:
+        transport = HttpxTransport(client, request_adapter=adapt_request, response_adapter=adapt_response)
+        with anyio.fail_after(3):
+            response = await execute(transport, streaming, RequestSpec("GET", "/eof"))
+            assert response.content == b"data: first\n\n"
+            assert closes == 1
+            await server.disconnected.wait()
+            assert (await client.get("/after")).status_code == 204

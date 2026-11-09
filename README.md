@@ -407,8 +407,9 @@ Use `async with stream` or explicitly await `stream.aclose()` when ending iterat
 Closing a stream interrupts and joins its active I/O, including header reception and response
 adaptation before the stream receives the response. It then joins response cleanup without waiting
 for application work between yielded events. Context cleanup preserves the consumer's original
-exception if cleanup fails. A close called inside that stream's own adapter or native hook requests
-closure without waiting on itself; external close callers wait for completion.
+exception if cleanup fails. A close called inside that stream's own adapter, native hook, or
+response-cleanup callback requests closure without waiting on itself; external close callers
+wait for completion, including when callbacks delegate work to child tasks.
 
 The existing `adapters=` argument remains supported for legacy `(transport, request)` adapters;
 it runs before the new request-adapter chain. Prefer the independent `request_adapter=` and

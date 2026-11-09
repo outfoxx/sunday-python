@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 
 import httpx
 
 from ._async import complete, in_operation, run_io
+
+_cleanup_owners: ContextVar[tuple[_ClosingStream, ...]] = ContextVar("sunday_httpx_cleanup_owners", default=())
 
 
 class _ClosingStream(httpx.AsyncByteStream):
@@ -32,10 +35,29 @@ class _ClosingStream(httpx.AsyncByteStream):
                 return
             yield chunk
 
+    def owns_cleanup(self) -> bool:
+        return self in _cleanup_owners.get() and (self._cleanup is None or not self._cleanup.done())
+
     async def aclose(self) -> None:
+        if self.owns_cleanup():
+            return
         if self._cleanup is None:
-            self._cleanup = asyncio.create_task(self._stream.aclose())
+            self._cleanup = asyncio.create_task(self._close())
         await complete(self._cleanup)
+
+    async def _close(self) -> None:
+        # Trace callbacks (and their child tasks) cannot join the cleanup that
+        # needs them to return. Completed cleanup still exposes its result.
+        token = _cleanup_owners.set((*_cleanup_owners.get(), self))
+        try:
+            await self._stream.aclose()
+        finally:
+            _cleanup_owners.reset(token)
+
+
+def in_response_cleanup(response: httpx.Response) -> bool:
+    """Return whether this callback belongs to the response's active cleanup."""
+    return isinstance(response.stream, _ClosingStream) and response.stream.owns_cleanup()
 
 
 def protect_response(response: httpx.Response) -> None:

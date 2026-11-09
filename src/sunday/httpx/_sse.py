@@ -28,7 +28,7 @@ from ..sse import EventParser, EventStreamOptions, ServerSentEvent
 from ..token_provider import TokenProviderError
 from ._async import complete, run_io
 from ._reconnect import _ReconnectPolicy
-from ._response_cleanup import close_response
+from ._response_cleanup import close_response, in_response_cleanup
 from ._security import AuthenticationRecoveryBudget, RequestSecurity
 
 if TYPE_CHECKING:
@@ -111,9 +111,11 @@ class HttpxEventStream[EventT]:
     async def _close(self, error: BaseException | None = None) -> None:
         self._close_nowait()
         active = self._active_io
-        # Adapter and native-hook child tasks inherit their I/O ownership. They
-        # cannot join an attempt that is waiting for that same callback to return.
-        if active is not None and any(owner is active for owner in _io_owners.get()):
+        # Callbacks cannot join the I/O or cleanup waiting for them to return.
+        # Keep the response reference so external callers still join its cleanup.
+        if (active is not None and any(owner is active for owner in _io_owners.get())) or (
+            self._response is not None and in_response_cleanup(self._response)
+        ):
             return
         try:
             if active is None:
