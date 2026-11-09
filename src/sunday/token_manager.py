@@ -11,28 +11,25 @@ import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, replace
 from time import time
 from typing import cast
+from uuid import uuid4
 
+from .request_cancellation_error import RequestCancellationError
 from .security import SecurityBinding
 from .token_provider import (
     AuthorizationRequiredError,
     RefreshingTokenProvider,
+    TokenConfiguration,
+    TokenLease,
     TokenProvider,
     TokenProviderError,
     TokenRequest,
     TokenSet,
     TokenStore,
+    _resolve_token_request,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class TokenLease:
-    """Receipt for invalidating only the credential that a server rejected."""
-
-    key: str = field(repr=False)
-    tokens: TokenSet = field(repr=False)
 
 
 @dataclass(slots=True)
@@ -58,7 +55,7 @@ class TokenManager:
 
     def __init__(
         self,
-        providers: Mapping[str, TokenProvider],
+        providers: Mapping[str, TokenProvider] | TokenProvider,
         *,
         store: TokenStore | None = None,
         expiry_skew: float = 30,
@@ -66,13 +63,24 @@ class TokenManager:
     ) -> None:
         if not math.isfinite(expiry_skew) or expiry_skew < 0:
             raise ValueError("Invalid token expiry skew")
-        self._providers = dict(providers)
+        self._provider = None if isinstance(providers, Mapping) else providers
+        self._providers = dict(providers) if isinstance(providers, Mapping) else {}
+        self.identity = self._provider.identity if self._provider is not None else str(uuid4())
         self._store = store if store is not None else _MemoryTokenStore()
         self._skew = expiry_skew
         self._now = now
         self._renewals: dict[str, _Renewal] = {}
         self._locks: dict[str, _Lock] = {}
         self._authorization_attempts: set[bytes] = set()
+
+    def configure(self, binding: SecurityBinding) -> TokenConfiguration:
+        """Forward configuration to the explicitly managed provider."""
+        provider = self._provider if self._provider is not None else self._providers[binding.provider]
+        return provider.configure(binding)
+
+    async def acquire(self, request: TokenRequest) -> TokenSet:
+        """Acquire managed credentials; transports use receipts to preserve rejection identity."""
+        return (await self.credentials(request)).tokens
 
     async def credentials(self, binding: SecurityBinding) -> TokenLease:
         """Obtain current credentials without reusing a failed or consumed authorization grant."""
@@ -87,7 +95,14 @@ class TokenManager:
             task.add_done_callback(lambda completed: self._finished(key, completed))
         renewal.waiters += 1
         try:
-            return await asyncio.shield(renewal.task)
+            await asyncio.wait((renewal.task,))
+            lease = renewal.task.result()
+
+            async def reject() -> bool:
+                await self.invalidate(lease)
+                return True
+
+            return replace(lease, rejection=reject)
         finally:
             renewal.waiters -= 1
             if renewal.waiters == 0 and not renewal.committing and not renewal.task.done():
@@ -100,27 +115,17 @@ class TokenManager:
                 current = await self._store.load(lease.key)
                 if current is not None and current.access_token == lease.tokens.access_token:
                     await self._store.save(lease.key, replace(current, expires_at=0))
+        except RequestCancellationError:
+            raise
         except Exception:
             raise TokenProviderError() from None
 
     def _resolve(self, binding: SecurityBinding) -> tuple[TokenProvider, TokenRequest, str]:
         try:
-            provider = self._providers[binding.provider]
-            config = provider.configure(binding)
-            if not provider.identity.strip() or not config.client_identity.strip():
+            provider = self._provider if self._provider is not None else self._providers[binding.provider]
+            request = _resolve_token_request(provider, binding)
+            if request.flow == "authorizationCode" and not (request.grant_identity or "").strip():
                 raise TokenProviderError()
-            if binding.flow == "authorizationCode" and not (config.grant_identity or "").strip():
-                raise TokenProviderError()
-            values = {item.name: getattr(binding, item.name) for item in fields(binding)}
-            if config.endpoints is not None:
-                for item in fields(config.endpoints):
-                    value = getattr(config.endpoints, item.name)
-                    if value is not None:
-                        values[item.name] = value
-            values["scopes"] = tuple(sorted(set(binding.scopes)))
-            request = TokenRequest(
-                **values, client_identity=config.client_identity, grant_identity=config.grant_identity
-            )
             key = json.dumps(
                 [
                     request.scheme,
@@ -141,6 +146,8 @@ class TokenManager:
                 separators=(",", ":"),
             )
             return provider, request, key
+        except RequestCancellationError:
+            raise
         except Exception:
             raise TokenProviderError() from None
 
@@ -169,6 +176,8 @@ class TokenManager:
                         if tokens.refresh_token is None:
                             tokens = replace(tokens, refresh_token=stored.refresh_token)
                     except TokenProviderError as error:
+                        if isinstance(error, RequestCancellationError):
+                            raise
                         if error.reason != "invalid_grant" or request.flow != "clientCredentials":
                             raise
                         await asyncio.sleep(0)
@@ -204,6 +213,8 @@ class TokenManager:
                 await self._store.save(key, tokens)
                 return TokenLease(key, tokens)
         except (AuthorizationRequiredError, TokenProviderError):
+            raise
+        except RequestCancellationError:
             raise
         except Exception:
             raise TokenProviderError() from None

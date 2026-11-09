@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Callable
-from contextlib import suppress
+import sys
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 import anyio
@@ -19,20 +22,32 @@ import httpx
 from ..errors import TransportError, UnexpectedResponse
 from ..event_source import EventSourceErrorHandler, EventSourceMessageHandler, EventSourceOpenHandler, EventSourceState
 from ..media import MediaType
+from ..request_cancellation_error import RequestCancellationError
 from ..specs import RequestSpec
 from ..sse import EventParser, EventStreamOptions, ServerSentEvent
 from ..token_provider import TokenProviderError
+from ._async import complete, run_io
 from ._reconnect import _ReconnectPolicy
-from ._security import AuthenticationRecoveryBudget
+from ._response_cleanup import close_response
+from ._security import AuthenticationRecoveryBudget, RequestSecurity
 
 if TYPE_CHECKING:
     from ._transport import HttpxEventSourceRequestFactory, HttpxTransport
 
 _KEEPALIVE_TIMEOUT_FLOOR = 1.0
+_io_owners: ContextVar[tuple[HttpxEventStream._IO, ...]] = ContextVar("sunday_event_stream_io_owners", default=())
 
 
 class HttpxEventStream[EventT]:
     """Reconnectable HTTPX server-sent event stream."""
+
+    @dataclass(frozen=True, slots=True)
+    class _IO:
+        """Completion of an I/O block, independent of the consumer's lifetime."""
+
+        scope: anyio.CancelScope
+        task: asyncio.Task[Any] | None = field(default_factory=asyncio.current_task)
+        done: anyio.Event = field(default_factory=anyio.Event)
 
     def __init__(
         self,
@@ -57,7 +72,7 @@ class HttpxEventStream[EventT]:
         self._closed = False
         self._running = False
         self._response: httpx.Response | None = None
-        self._cancel_scope: anyio.CancelScope | None = None
+        self._active_io: HttpxEventStream._IO | None = None
         self._close_event: anyio.Event | None = None
         self._retry_time = self._options.retry
 
@@ -82,24 +97,71 @@ class HttpxEventStream[EventT]:
         traceback: TracebackType | None,
     ) -> None:
         """Close the event stream when leaving its lifecycle scope."""
-        del exc_type, exc_value, traceback
-        await self.aclose()
+        del exc_type, traceback
+        await self._close(exc_value)
 
     async def aclose(self) -> None:
-        """Close the active response and interrupt reads or retry waits."""
+        """Interrupt active work and wait for its I/O and response cleanup.
+
+        A call from within this stream's active adapter or native hook requests
+        closure without waiting on itself; external callers join completion.
+        """
+        await self._close()
+
+    async def _close(self, error: BaseException | None = None) -> None:
         self._close_nowait()
-        if self._response is not None:
-            with anyio.CancelScope(shield=True):
-                await self._response.aclose()
+        active = self._active_io
+        # Adapter and native-hook child tasks inherit their I/O ownership. They
+        # cannot join an attempt that is waiting for that same callback to return.
+        if active is not None and any(owner is active for owner in _io_owners.get()):
+            return
+        try:
+            if active is None:
+                await self._release_response()
+            else:
+                await complete(asyncio.create_task(self._finish_close(active)))
+        except BaseException:
+            if error is None:
+                raise
+            error.add_note("Closing the HTTP response also failed")
+
+    async def _finish_close(self, active: _IO) -> None:
+        await active.done.wait()
+        await self._release_response()
+
+    async def _release_response(self, error: BaseException | None = None) -> None:
+        response = self._response
+        if response is not None:
+            try:
+                await close_response(response, error)
+            finally:
+                if self._response is response:
+                    self._response = None
+
+    @contextmanager
+    def _interruptible(self) -> Iterator[None]:
+        """Interrupt active I/O without leaving a cancel scope around a yielded event."""
+        with anyio.CancelScope() as scope:
+            active = self._IO(scope)
+            self._active_io = active
+            token = _io_owners.set((*_io_owners.get(), active))
+            try:
+                if self._closed:
+                    scope.cancel()
+                yield
+            finally:
+                _io_owners.reset(token)
+                self._active_io = None
+                active.done.set()
 
     def _close_nowait(self) -> None:
         self._closed = True
         if self._close_event is not None:
             self._close_event.set()
-        if self._cancel_scope is not None:
-            self._cancel_scope.cancel()
+        if self._active_io is not None:
+            self._active_io.scope.cancel()
 
-    async def events(self) -> AsyncIterator[EventT]:
+    async def events(self) -> AsyncGenerator[EventT, None]:
         """Connect, reconnect, and yield decoded server-sent events."""
         if self._running:
             raise TransportError("An event stream supports only one active consumer")
@@ -110,12 +172,11 @@ class HttpxEventStream[EventT]:
         recovery_budget = AuthenticationRecoveryBudget()
 
         try:
-            with anyio.CancelScope() as cancel_scope:
-                self._cancel_scope = cancel_scope
-                while not self._closed:
-                    response: httpx.Response | None = None
-                    connected = False
-                    try:
+            while not self._closed:
+                response: httpx.Response | None = None
+                connected = False
+                try:
+                    with self._interruptible():
                         headers = [("Accept", "text/event-stream"), ("Cache-Control", "no-store")]
                         if last_event_id is not None:
                             headers.append(("Last-Event-ID", last_event_id))
@@ -124,72 +185,76 @@ class HttpxEventStream[EventT]:
                         else:
                             request_value = self._request_factory(tuple(headers))
                             request = await request_value if inspect.isawaitable(request_value) else request_value
-                        request = await self._transport._adapt_request(request)
                         self._disable_httpx_read_timeout(request)
-                        response = await self._transport._send_event_stream(request, recovery_budget=recovery_budget)
+                        response = await self._transport._send_event_stream(
+                            request,
+                            recovery_budget=recovery_budget,
+                            security=RequestSecurity(self._spec.security) if self._spec.security is not None else None,
+                        )
                         self._response = response
 
                         if response.status_code == 204:
                             return
                         if not 200 <= response.status_code < 300:
-                            body = await response.aread()
+                            body = await run_io(response.aread)
                             self._transport.raise_problem(response, body)
                         self._validate_content_type(response)
-                        connected = True
-                        reconnect.opened()
-                        if self._on_open is not None:
-                            self._on_open()
+                    if self._closed:
+                        return
+                    connected = True
+                    reconnect.opened()
+                    if self._on_open is not None:
+                        self._on_open()
 
-                        parser = EventParser()
-                        timeout_state: list[float | None] = [None]
+                    parser = EventParser()
+                    timeout_state: list[float | None] = [None]
 
-                        def current_timeout(state: list[float | None] = timeout_state) -> float | None:
-                            return state[0]
+                    def current_timeout(state: list[float | None] = timeout_state) -> float | None:
+                        return state[0]
 
-                        async for chunk in self._chunks(response, current_timeout):
-                            for event in parser.feed(chunk):
-                                timeout_state[0], last_event_id = self._apply_controls(
-                                    event,
-                                    reconnect,
-                                    timeout_state[0],
-                                    last_event_id,
-                                )
-                                if event.data is not None:
-                                    decoded = self._decoder(event)
-                                    if decoded is not None:
-                                        yield decoded
-                        for event in parser.finalize():
+                    async for chunk in self._chunks(response, current_timeout):
+                        for event in parser.feed(chunk):
                             timeout_state[0], last_event_id = self._apply_controls(
-                                event,
-                                reconnect,
-                                timeout_state[0],
-                                last_event_id,
+                                event, reconnect, timeout_state[0], last_event_id
                             )
                             if event.data is not None:
                                 decoded = self._decoder(event)
                                 if decoded is not None:
                                     yield decoded
-                    except (httpx.TransportError, TimeoutError, TokenProviderError) as error:
-                        if isinstance(error, TokenProviderError) and error.reason != "temporary":
-                            raise
-                        if self._closed:
-                            return
-                        if self._on_error is not None:
-                            self._on_error(error)
-                    finally:
-                        if response is not None:
-                            with anyio.CancelScope(shield=True):
-                                await response.aclose()
-                        self._response = None
-
+                                    if self._closed:
+                                        return
                     if self._closed:
                         return
-                    if self._on_connecting is not None:
-                        self._on_connecting()
-                    delay = reconnect.next_delay(failed=not connected)
-                    await self._wait_for_retry(delay)
+                    for event in parser.finalize():
+                        timeout_state[0], last_event_id = self._apply_controls(
+                            event, reconnect, timeout_state[0], last_event_id
+                        )
+                        if event.data is not None:
+                            decoded = self._decoder(event)
+                            if decoded is not None:
+                                yield decoded
+                                if self._closed:
+                                    return
+                except RequestCancellationError:
+                    raise
+                except (httpx.TransportError, TimeoutError, TokenProviderError) as error:
+                    if isinstance(error, TokenProviderError) and error.reason != "temporary":
+                        raise
+                    if self._closed:
+                        return
+                    if self._on_error is not None:
+                        self._on_error(error)
+                finally:
+                    await self._release_response(sys.exception())
+
+                if self._closed:
+                    return
+                if self._on_connecting is not None:
+                    self._on_connecting()
+                delay = reconnect.next_delay(failed=not connected)
+                await self._wait_for_retry(delay)
         finally:
-            self._cancel_scope = None
+            self._active_io = None
             self._close_event = None
             self._running = False
 
@@ -199,15 +264,18 @@ class HttpxEventStream[EventT]:
         timeout: Callable[[], float | None],
     ) -> AsyncIterator[bytes]:
         iterator = response.aiter_bytes().__aiter__()
-        while True:
+        while not self._closed:
             try:
-                current_timeout = timeout()
-                if current_timeout is None:
-                    chunk = await anext(iterator)
-                else:
-                    with anyio.fail_after(current_timeout):
-                        chunk = await anext(iterator)
+                with self._interruptible():
+                    current_timeout = timeout()
+                    if current_timeout is None:
+                        chunk = await run_io(lambda: anext(iterator))
+                    else:
+                        with anyio.fail_after(current_timeout):
+                            chunk = await run_io(lambda: anext(iterator))
             except StopAsyncIteration:
+                return
+            if self._closed:
                 return
             yield chunk
 
@@ -265,13 +333,15 @@ class HttpxEventSource:
         request_factory: HttpxEventSourceRequestFactory,
         *,
         options: EventStreamOptions | None = None,
+        spec: RequestSpec[None] | None = None,
     ) -> None:
         self._transport = transport
         self._request_factory = request_factory
         self._options = options or EventStreamOptions()
+        self._spec = spec or RequestSpec("GET", "/")
         self._ready_state = EventSourceState.CLOSED
         self._stream: HttpxEventStream[ServerSentEvent] | None = None
-        self._task: asyncio.Task[None] | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
         self._listeners: dict[str, dict[UUID, EventSourceMessageHandler]] = {}
         self.on_open: EventSourceOpenHandler | None = None
         self.on_error: EventSourceErrorHandler | None = None
@@ -311,59 +381,73 @@ class HttpxEventSource:
             raise TransportError("HttpxTransport is closed")
         self._ready_state = EventSourceState.CONNECTING
         self._transport._event_source_started(self)
-        self._stream = HttpxEventStream(
+        stream = HttpxEventStream(
             self._transport,
-            RequestSpec("GET", "/"),
+            self._spec,
             lambda event: event,
             options=self._options,
             request_factory=self._request_factory,
-            on_open=self._opened,
-            on_error=self._retrying,
-            on_connecting=self._connecting,
+            on_open=lambda: self._opened(stream),
+            on_error=lambda error: self._retrying(stream, error),
+            on_connecting=lambda: self._connecting(stream),
         )
-        self._task = loop.create_task(self._run(), name="sunday-httpx-event-source")
+        self._stream = stream
+        task = loop.create_task(self._run(stream), name="sunday-httpx-event-source")
+        self._tasks.add(task)
+        task.add_done_callback(self._finished)
 
     def close(self) -> None:
         """Close the source and interrupt active reads or reconnect waits."""
         self._ready_state = EventSourceState.CLOSED
         if self._stream is not None:
             self._stream._close_nowait()
-        if self._task is not None:
-            self._task.cancel()
-        else:
+        if not self._tasks:
             self._transport._event_source_closed(self)
 
-    async def _wait_closed(self) -> None:
-        task = self._task
-        if task is not None:
-            with suppress(asyncio.CancelledError):
-                await task
+    def _owns_current_io(self) -> bool:
+        # Native hook child tasks inherit the initiating run's I/O record. Include
+        # retiring runs, whose streams may no longer be self._stream.
+        return any(owner.task in self._tasks and not owner.done.is_set() for owner in _io_owners.get())
 
-    async def _run(self) -> None:
+    async def _wait_closed(self) -> None:
+        if self._tasks:
+            await asyncio.wait(tuple(self._tasks))
+
+    async def _run(self, stream: HttpxEventStream[ServerSentEvent]) -> None:
         try:
-            assert self._stream is not None
-            async for event in self._stream:
-                self._dispatch(event)
+            if not stream._closed:
+                async with stream:
+                    async for event in stream:
+                        if self._stream is stream:
+                            self._dispatch(event)
         except asyncio.CancelledError:
             raise
         except BaseException as error:
-            self._invoke(self.on_error, error)
+            if self._stream is stream:
+                self._invoke(self.on_error, error)
         finally:
-            if self._stream is not None:
-                await self._stream.aclose()
-            self._ready_state = EventSourceState.CLOSED
+            if self._stream is stream:
+                self._ready_state = EventSourceState.CLOSED
+
+    def _finished(self, task: asyncio.Task[None]) -> None:
+        # Retiring runs still own resources even after a replacement has connected.
+        self._tasks.discard(task)
+        if not self._tasks:
             self._transport._event_source_closed(self)
 
-    def _opened(self) -> None:
-        self._ready_state = EventSourceState.OPEN
-        self._invoke(self.on_open)
+    def _opened(self, stream: HttpxEventStream[ServerSentEvent]) -> None:
+        if self._stream is stream:
+            self._ready_state = EventSourceState.OPEN
+            self._invoke(self.on_open)
 
-    def _retrying(self, error: BaseException) -> None:
-        self._ready_state = EventSourceState.CONNECTING
-        self._invoke(self.on_error, error)
+    def _retrying(self, stream: HttpxEventStream[ServerSentEvent], error: BaseException) -> None:
+        if self._stream is stream:
+            self._ready_state = EventSourceState.CONNECTING
+            self._invoke(self.on_error, error)
 
-    def _connecting(self) -> None:
-        self._ready_state = EventSourceState.CONNECTING
+    def _connecting(self, stream: HttpxEventStream[ServerSentEvent]) -> None:
+        if self._stream is stream:
+            self._ready_state = EventSourceState.CONNECTING
 
     def _dispatch(self, event: ServerSentEvent) -> None:
         self._invoke(self.on_message, event)

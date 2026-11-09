@@ -16,6 +16,7 @@ from sunday import (
     EventSourceState,
     EventStreamOptions,
     Problem,
+    RequestCancellationError,
     RequestEncodingError,
     RequestSpec,
     TransportError,
@@ -368,7 +369,7 @@ async def test_keepalive_timeout_does_not_leak_to_next_connection(monkeypatch: p
 
 
 @pytest.mark.anyio
-async def test_event_stream_follows_redirects_without_reapplying_adapters() -> None:
+async def test_event_stream_readapts_each_managed_redirect() -> None:
     requests: list[httpx.Request] = []
     adaptations = 0
 
@@ -394,7 +395,7 @@ async def test_event_stream_follows_redirects_without_reapplying_adapters() -> N
         assert [event async for event in stream] == []
 
     assert [request.url.path for request in requests] == ["/events", "/redirected"]
-    assert adaptations == 1
+    assert adaptations == 2
 
 
 @pytest.mark.anyio
@@ -646,3 +647,198 @@ async def test_invalid_parameters_are_terminal_encoding_errors_for_sse() -> None
         assert errors[0].__cause__ is failure
         assert validations == 2
         assert sends == 0
+
+
+class TrackedChunks(Chunks):
+    def __init__(self, *chunks: bytes, close_error: BaseException | None = None) -> None:
+        super().__init__(*chunks)
+        self.closes = 0
+        self.close_error = close_error
+
+    async def aclose(self) -> None:
+        self.closes += 1
+        await anyio.sleep(0)
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("close_mode", ["context", "explicit", "external"])
+async def test_early_stream_exit_leaves_consumer_task_usable(close_mode: str) -> None:
+    body = TrackedChunks(b"data: first\n\ndata: second\n\n")
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/after":
+            return httpx.Response(204)
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=body)
+
+    async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
+        transport = HttpxTransport(client)
+        stream = transport.event_stream(RequestSpec("GET", "/events"), lambda event: event.data)
+        iterator = stream.events()
+        try:
+            if close_mode == "context":
+                async with stream:
+                    async for value in iterator:
+                        assert value == "first"
+                        break
+            else:
+                assert await anext(iterator) == "first"
+                if close_mode == "external":
+                    await asyncio.create_task(stream.aclose())
+                else:
+                    await stream.aclose()
+            # Closing an SSE stream must not leave cancellation active in its consumer.
+            await anyio.sleep(0)
+            assert (await transport.execute_request(RequestSpec("GET", "/after"))).status_code == 204
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+            await stream.aclose()
+        finally:
+            await iterator.aclose()
+    assert body.closed and body.closes == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("error_kind", ["stop", "task-cancellation", "ordinary"])
+async def test_stream_context_cleanup_preserves_consumer_error_identity(error_kind: str) -> None:
+    error = {
+        "stop": RequestCancellationError("consumer stop"),
+        "task-cancellation": asyncio.CancelledError("consumer cancellation"),
+        "ordinary": ValueError("consumer failure"),
+    }[error_kind]
+    body = TrackedChunks(b"data: value\n\n", close_error=RuntimeError("cleanup failure"))
+    async with httpx.AsyncClient(
+        base_url="https://api.example",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=body)
+        ),
+    ) as client:
+        stream = HttpxTransport(client).event_stream(RequestSpec("GET", "/events"), lambda event: event.data)
+        iterator = stream.events()
+        try:
+            with pytest.raises(type(error)) as failure:
+                async with stream:
+                    assert await anext(iterator) == "value"
+                    raise error
+            assert failure.value is error
+            assert "Closing the HTTP response also failed" in error.__notes__
+            await anyio.sleep(0)
+            await stream.aclose()
+        finally:
+            await iterator.aclose()
+    assert body.closes == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("error_type", [RequestCancellationError, asyncio.CancelledError, RuntimeError])
+async def test_stream_context_propagates_cleanup_failure_without_primary_error(
+    error_type: type[BaseException],
+) -> None:
+    error = error_type("cleanup stop")
+    body = TrackedChunks(b"data: value\n\n", close_error=error)
+    async with httpx.AsyncClient(
+        base_url="https://api.example",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=body)
+        ),
+    ) as client:
+        stream = HttpxTransport(client).event_stream(RequestSpec("GET", "/events"), lambda event: event.data)
+        iterator = stream.events()
+        try:
+            with pytest.raises(error_type) as failure:
+                async with stream:
+                    await anext(iterator)
+            assert failure.value is error
+            await stream.aclose()
+        finally:
+            await iterator.aclose()
+    assert body.closes == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stage", ["request", "response"])
+async def test_stream_close_interrupts_adapters_without_cancelling_consumer(stage: str) -> None:
+    entered = anyio.Event()
+    body = TrackedChunks(b"data: value\n\n")
+
+    async def adapt_request(request: httpx.Request) -> httpx.Request:
+        if stage == "request":
+            entered.set()
+            await anyio.sleep_forever()
+        return request
+
+    async def adapt_response(response: httpx.Response, request: httpx.Request) -> httpx.Response:
+        if stage == "response":
+            entered.set()
+            await anyio.sleep_forever()
+        return response
+
+    async with httpx.AsyncClient(
+        base_url="https://api.example",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=body)
+        ),
+    ) as client:
+        transport = HttpxTransport(client, request_adapter=adapt_request, response_adapter=adapt_response)
+        stream = transport.event_stream(RequestSpec("GET", "/events"), lambda event: event.data)
+        completed = anyio.Event()
+
+        async def consume() -> None:
+            assert [event async for event in stream] == []
+            await anyio.sleep(0)
+            completed.set()
+
+        with anyio.fail_after(2):
+            async with anyio.create_task_group() as group:
+                group.start_soon(consume)
+                await entered.wait()
+                await stream.aclose()
+                assert body.closes == (1 if stage == "response" else 0)
+                await completed.wait()
+    assert body.closes == (1 if stage == "response" else 0)
+
+
+@pytest.mark.anyio
+async def test_early_stream_exit_releases_native_connection_before_client_close() -> None:
+    from anyio.abc import SocketAttribute, SocketStream
+
+    disconnected = anyio.Event()
+
+    async def serve(socket: SocketStream) -> None:
+        async with socket:
+            headers = bytearray()
+            while b"\r\n\r\n" not in headers:
+                headers.extend(await socket.receive())
+            if headers.startswith(b"GET /after "):
+                await socket.send(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                return
+            await socket.send(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1024\r\n\r\ndata: value\n\n"
+            )
+            with pytest.raises(anyio.EndOfStream):
+                await socket.receive()
+            disconnected.set()
+
+    listener = await anyio.create_tcp_listener(local_host="127.0.0.1")
+    port = listener.extra(SocketAttribute.local_port)
+    async with listener, anyio.create_task_group() as group:
+        group.start_soon(listener.serve, serve)
+        try:
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{port}", trust_env=False, limits=httpx.Limits(max_connections=1)
+            ) as client:
+                transport = HttpxTransport(client)
+                stream = transport.event_stream(RequestSpec("GET", "/events"), lambda event: event.data)
+                iterator = stream.events()
+                try:
+                    with anyio.fail_after(2):
+                        async with stream:
+                            assert await anext(iterator) == "value"
+                        await disconnected.wait()
+                        assert (await transport.execute_request(RequestSpec("GET", "/after"))).status_code == 204
+                finally:
+                    await iterator.aclose()
+        finally:
+            group.cancel_scope.cancel()

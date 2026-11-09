@@ -20,6 +20,7 @@ from sunday import (
     TokenConfiguration,
     TokenRequest,
     TokenSet,
+    provider_credentials,
 )
 from sunday.httpx import AuthorizationGrant, HttpxTransport
 
@@ -42,8 +43,8 @@ def test_static_settings_and_httpx_adapter() -> None:
         async with httpx.AsyncClient(base_url=settings.base_url) as client:
             transport = HttpxTransport.from_settings(settings, client)
             assert transport.client is client
-            assert transport.token_manager is not None
-            lease = await transport.token_manager.credentials(BINDING)
+            assert transport.token_providers
+            lease = await provider_credentials(transport.token_providers[BINDING.provider], BINDING)
             assert lease.tokens.access_token == "private-token"
 
     asyncio.run(check())
@@ -125,9 +126,9 @@ def test_token_manager_isolation() -> None:
                 "https://api.example", {"list": [BINDING]}, {"identity": BearerCredentials(token)}
             )
 
-            manager = settings.token_manager
+            manager = settings.token_providers.get(BINDING.provider)
             assert manager is not None
-            assert (await manager.credentials(BINDING)).tokens.access_token == token
+            assert (await provider_credentials(manager, BINDING)).tokens.access_token == token
 
     asyncio.run(run())
 
@@ -165,7 +166,7 @@ def test_oauth_manager_is_prepared_once_before_transport_construction() -> None:
     settings = ClientSettings.resolve(
         "https://api.example/v1", {"list": [[oauth]], "read": [[oauth]]}, {"identity": credentials}
     )
-    assert settings.token_manager is not None
+    assert settings.token_providers.get(BINDING.provider) is not None
     assert len(calls) == 1
     assert credentials.endpoints is not None
     assert credentials.endpoints.token_url == "oauth/token"

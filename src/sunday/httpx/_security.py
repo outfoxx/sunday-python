@@ -8,14 +8,15 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import quote
 
 import httpx
 
 from ..security import SecurityBinding
-from ..token_manager import TokenLease, TokenManager
-from ..token_provider import TokenProviderError
+from ..token_provider import TokenLease, TokenProvider, TokenProviderError, provider_credentials
+from ._requests import copy_request
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,12 +26,10 @@ class RequestSecurity:
     bindings: tuple[SecurityBinding, ...]
     leases: tuple[TokenLease, ...] = ()
 
-    async def authorize(self, request: httpx.Request, manager: TokenManager | None) -> RequestSecurity:
+    async def authorize(self, request: httpx.Request, providers: Mapping[str, TokenProvider]) -> RequestSecurity:
         """Attach the entire credential set after every provider succeeds."""
         if not self.bindings:
             return self
-        if manager is None:
-            raise TokenProviderError()
         url, headers = request.url, httpx.Headers(request.headers)
         if "authorization" in headers and not any(
             binding.transport.location == "header" and binding.transport.name.lower() == "authorization"
@@ -52,7 +51,9 @@ class RequestSecurity:
             ):
                 raise TokenProviderError()
         # Acquiring sequentially avoids leaving sibling tasks running when one provider fails.
-        leases = tuple([await manager.credentials(binding) for binding in self.bindings])
+        if any(binding.provider not in providers for binding in self.bindings):
+            raise TokenProviderError()
+        leases = tuple([await provider_credentials(providers[binding.provider], binding) for binding in self.bindings])
         for binding, lease in zip(self.bindings, leases, strict=True):
             transport = binding.transport
             credential = lease.tokens.access_token
@@ -71,13 +72,8 @@ class RequestSecurity:
         return RequestSecurity(self.bindings, leases)
 
     def rejected_leases(self, request: httpx.Request, response: httpx.Response) -> tuple[TokenLease, ...]:
-        """Recover only safe bodyless requests with an explicit invalid bearer token challenge."""
-        if response.status_code != 401 or request.method not in {"GET", "HEAD", "OPTIONS"}:
-            return ()
-        try:
-            if request.content:
-                return ()
-        except httpx.RequestNotRead:
+        """Identify rejected receipts regardless of method safety or remaining retries."""
+        if response.status_code != 401:
             return ()
         if not _invalid_bearer_challenge(response.headers.get("www-authenticate", "")):
             return ()
@@ -87,6 +83,7 @@ class RequestSecurity:
             if binding.transport.location == "header"
             and binding.transport.name.lower() == "authorization"
             and (binding.transport.prefix or "").lower() == "bearer"
+            and _bearer_token(request) == lease.tokens.access_token
         )
 
     def diagnostic_request(self, request: httpx.Request) -> httpx.Request:
@@ -100,7 +97,7 @@ class RequestSecurity:
                 headers[transport.name] = "[redacted]"
             else:
                 headers["cookie"] = "[redacted]"
-        return httpx.Request(request.method, url, headers=headers)
+        return copy_request(request, url=url, headers=headers)
 
 
 def _cookies(headers: httpx.Headers) -> list[tuple[str, str]]:
@@ -146,8 +143,29 @@ class AuthenticationRecoveryBudget:
     def __init__(self) -> None:
         self._used = False
 
+    def should_retry(self, request: httpx.Request, response: httpx.Response) -> bool:
+        """Allow one bodyless safe-method retry after explicit token rejection."""
+        if (
+            request.method not in {"GET", "HEAD", "OPTIONS"}
+            or response.status_code != 401
+            or _bearer_token(request) is None
+            or not _invalid_bearer_challenge(response.headers.get("www-authenticate", ""))
+        ):
+            return False
+        try:
+            if request.content:
+                return False
+        except httpx.RequestNotRead:
+            return False
+        return self.consume()
+
     def consume(self) -> bool:
         if self._used:
             return False
         self._used = True
         return True
+
+
+def _bearer_token(request: httpx.Request) -> str | None:
+    parts = request.headers.get("authorization", "").split()
+    return parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else None

@@ -9,6 +9,7 @@ from typing import Literal, cast
 
 import pytest
 
+from sunday.request_cancellation_error import RequestCancellationError
 from sunday.security import SecurityBinding, SecurityEndpoints, SecurityTransport
 from sunday.token_manager import TokenManager
 from sunday.token_provider import (
@@ -17,6 +18,7 @@ from sunday.token_provider import (
     TokenProviderError,
     TokenRequest,
     TokenSet,
+    provider_credentials,
 )
 
 BINDING = SecurityBinding(
@@ -340,3 +342,96 @@ async def test_interactive_attempt_history_is_bounded_without_reusing_failed_gra
     with pytest.raises(TokenProviderError):
         await fresh.credentials(binding)
     assert len(provider.acquisitions) == 1025
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("managed", [False, True])
+async def test_provider_request_resolution_preserves_configuration(managed: bool) -> None:
+    provider = Provider()
+    provider.tokens = TokenSet("token")
+    provider.configuration = TokenConfiguration(
+        "client", "session", SecurityEndpoints(token_url="https://override.example/token")
+    )
+    binding = replace(BINDING, scopes=("write", "read", "read"), refresh_url="https://identity.example/refresh")
+    source = TokenManager(provider) if managed else provider
+    await provider_credentials(source, binding)
+    assert provider.acquisitions == [
+        TokenRequest(
+            scheme=binding.scheme,
+            provider=binding.provider,
+            profile=binding.profile,
+            flow=binding.flow,
+            transport=binding.transport,
+            token_url="https://override.example/token",
+            refresh_url="https://identity.example/refresh",
+            scopes=("read", "write"),
+            client_identity="client",
+            grant_identity="session",
+        )
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("managed", [False, True])
+async def test_provider_configuration_stop_preserves_identity(managed: bool) -> None:
+    stop = RequestCancellationError("stop configuring credentials")
+
+    class StoppingProvider(Provider):
+        def configure(self, binding: SecurityBinding) -> TokenConfiguration:
+            raise stop
+
+    provider = StoppingProvider()
+    source = TokenManager(provider) if managed else provider
+    with pytest.raises(RequestCancellationError) as failure:
+        await provider_credentials(source, BINDING)
+    assert failure.value is stop
+    assert provider.acquisitions == []
+
+
+@pytest.mark.anyio
+async def test_external_provider_does_not_require_managed_grant_identity() -> None:
+    provider = Provider()
+    provider.tokens = TokenSet("token")
+    provider.configuration = TokenConfiguration("client")
+    binding = replace(BINDING, flow="authorizationCode")
+    assert (await provider_credentials(provider, binding)).tokens.access_token == "token"
+    with pytest.raises(TokenProviderError):
+        await provider_credentials(TokenManager(provider), binding)
+    assert len(provider.acquisitions) == 1
+
+
+@pytest.mark.anyio
+async def test_abandoned_persistence_failure_is_retrieved_without_duplicate_loop_reporting() -> None:
+    saving, finish = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    reported: list[object] = []
+
+    class Store:
+        async def load(self, _key: str) -> TokenSet | None:
+            return None
+
+        async def save(self, _key: str, _tokens: TokenSet) -> None:
+            saving.set()
+            await finish.wait()
+            raise RuntimeError("persistence failed after caller cancellation")
+
+        async def remove(self, _key: str) -> None:
+            pass
+
+    manager = TokenManager(Provider(), store=Store(), now=lambda: 0)
+    loop.set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
+    try:
+        waiter = asyncio.create_task(manager.credentials(BINDING))
+        await saving.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        finish.set()
+        while manager._renewals:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert reported == []
+    finally:
+        finish.set()
+        loop.set_exception_handler(previous)
