@@ -89,7 +89,14 @@ class RequestSecurity:
 
     def diagnostic_error(self, error: BaseException, request: httpx.Request) -> BaseException:
         """Sanitize managed HTTPX failures while preserving cancellation identity."""
-        if self.bindings and isinstance(error, httpx.RequestError) and not isinstance(error, RequestCancellationError):
+        if not self.bindings or isinstance(error, RequestCancellationError):
+            return error
+        if isinstance(error, httpx.HTTPStatusError):
+            diagnostic = self.diagnostic_request(request)
+            # Preserve the response and its body/metadata, just as on successful execution.
+            error.response.request = diagnostic
+            return type(error)("HTTP request failed", request=diagnostic, response=error.response)
+        if isinstance(error, httpx.RequestError):
             return type(error)("HTTP request failed", request=self.diagnostic_request(request))
         return error
 

@@ -330,7 +330,14 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         while True:
             sent = copy_request(prepared)
             authorized = await security.authorize(sent, self.token_providers) if security is not None else None
-            sent = await self._request_adapter.adapt(sent)
+            try:
+                sent = await self._request_adapter.adapt(sent)
+            except BaseException as error:
+                if authorized is not None:
+                    diagnostic_error = authorized.diagnostic_error(error, sent)
+                    if diagnostic_error is not error:
+                        raise diagnostic_error from None
+                raise
             response = await self._send_httpx(sent, security=authorized)
             effective = sent
             try:

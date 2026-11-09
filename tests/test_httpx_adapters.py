@@ -805,7 +805,15 @@ async def test_redirect_history_collection_preserves_stop_identity(streaming: bo
 
 @pytest.mark.parametrize(
     ("stage", "streaming"),
-    [("send", False), ("send", True), ("adapter", False), ("adapter", True), ("collection", False)],
+    [
+        ("request", False),
+        ("request", True),
+        ("send", False),
+        ("send", True),
+        ("adapter", False),
+        ("adapter", True),
+        ("collection", False),
+    ],
 )
 @pytest.mark.parametrize("bound_error", [False, True])
 @pytest.mark.parametrize("stop", [False, True])
@@ -820,15 +828,26 @@ async def test_managed_errors_sanitize_diagnostics_without_rewriting_stop_errors
         replace(BINDING, scheme="cookie", transport=SecurityTransport(location="cookie", name="session")),
     )
     sent: list[httpx.Request] = []
+    failed_requests: list[httpx.Request] = []
     errors: list[httpx.ReadError] = []
     bodies: list[Body] = []
 
-    def handle(request: httpx.Request) -> httpx.Response:
-        sent.append(request)
+    def make_error(request: httpx.Request) -> httpx.ReadError:
+        failed_requests.append(request)
         error = (Stop if stop else httpx.ReadError)(
             f"Read failed for {request.url}: {request.headers}", request=request if bound_error else None
         )
         errors.append(error)
+        return error
+
+    async def adapt_request(request: httpx.Request) -> httpx.Request:
+        if stage == "request":
+            raise make_error(request)
+        return request
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        error = make_error(request)
         if stage == "send":
             raise error
         body = Body(error=error)
@@ -846,12 +865,14 @@ async def test_managed_errors_sanitize_diagnostics_without_rewriting_stop_errors
         return response
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        transport = HttpxTransport(client, response_adapter=adapt, token_providers={"identity": provider})
+        transport = HttpxTransport(
+            client, request_adapter=adapt_request, response_adapter=adapt, token_providers={"identity": provider}
+        )
         with pytest.raises(httpx.ReadError) as failure:
             await perform(transport, streaming, RequestSpec("GET", "/value", security=bindings if managed else None))
     error = failure.value
-    assert len(sent) == 1
-    assert [body.closes for body in bodies] == ([] if stage == "send" else [1])
+    assert len(sent) == (0 if stage == "request" else 1)
+    assert [body.closes for body in bodies] == ([] if stage in {"request", "send"} else [1])
     if managed and not stop:
         assert type(error) is httpx.ReadError
         assert error is not errors[0]
@@ -862,8 +883,144 @@ async def test_managed_errors_sanitize_diagnostics_without_rewriting_stop_errors
         assert "token-" not in str(error.request.url)
         assert "token-" not in str(error.request.headers)
         assert error.__cause__ is None and error.__suppress_context__
+        assert failed_requests[0].headers["authorization"] == "Bearer token-1"
+        assert failed_requests[0].url.params["api_key"] == "token-2"
+        assert failed_requests[0].headers["cookie"] == "session=token-3"
+    else:
+        assert error is errors[0]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("stage", ["request", "hook", "response"])
+async def test_managed_adapter_and_hook_task_cancellation_keeps_identity(streaming: bool, stage: str) -> None:
+    cancellation = asyncio.CancelledError("original adapter cancellation")
+    body = Body()
+    sends = 0
+
+    async def adapt_request(request: httpx.Request) -> httpx.Request:
+        if stage == "request":
+            raise cancellation
+        return request
+
+    async def hook(response: httpx.Response) -> None:
+        if stage == "hook":
+            raise cancellation
+
+    async def adapt_response(response: httpx.Response, request: httpx.Request) -> httpx.Response:
+        raise cancellation
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return httpx.Response(200, stream=body)
+
+    async with httpx.AsyncClient(
+        base_url="https://api.example", transport=httpx.MockTransport(handle), event_hooks={"response": [hook]}
+    ) as client:
+        transport = HttpxTransport(
+            client,
+            request_adapter=adapt_request,
+            response_adapter=adapt_response,
+            token_providers={"identity": Provider()},
+        )
+        with pytest.raises(asyncio.CancelledError) as failure:
+            await perform(transport, streaming, RequestSpec("GET", "/value", security=(BINDING,)))
+        assert failure.value is cancellation
+    assert sends == body.closes == (0 if stage == "request" else 1)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("stage", ["hook", "adapter"])
+@pytest.mark.parametrize("buffered", [False, True])
+@pytest.mark.parametrize("stop", [False, True])
+@pytest.mark.parametrize("managed", [False, True])
+async def test_managed_status_errors_preserve_response_and_cancellation_identity(
+    streaming: bool, stage: str, buffered: bool, stop: bool, managed: bool
+) -> None:
+    class StatusStop(httpx.HTTPStatusError, RequestCancellationError):
+        pass
+
+    bindings = (
+        BINDING,
+        replace(BINDING, scheme="query", transport=SecurityTransport(location="query", name="api_key")),
+        replace(BINDING, scheme="cookie", transport=SecurityTransport(location="cookie", name="session")),
+    )
+    body = Body(b"original body")
+    sent: list[httpx.Request] = []
+    responses: list[httpx.Response] = []
+    originals: list[httpx.HTTPStatusError] = []
+    observed: list[BaseException] = []
+
+    class Observer:
+        def observe(self, event: TransportEvent) -> None:
+            if event.kind is TransportEventKind.FAILURE:
+                assert event.error is not None
+                observed.append(event.error)
+
+    async def fail(response: httpx.Response) -> None:
+        if buffered:
+            await response.aread()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            if stop:
+                error = StatusStop(str(error), request=error.request, response=error.response)
+            originals.append(error)
+            raise error
+
+    async def hook(response: httpx.Response) -> None:
+        if stage == "hook":
+            await fail(response)
+
+    async def adapt(response: httpx.Response, request: httpx.Request) -> httpx.Response:
+        await fail(response)
+        return response
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        response = httpx.Response(
+            403, headers={"X-Detail": "preserved"}, stream=body, extensions={"http_version": b"HTTP/1.1"}
+        )
+        responses.append(response)
+        return response
+
+    async with httpx.AsyncClient(
+        base_url="https://api.example", transport=httpx.MockTransport(handle), event_hooks={"response": [hook]}
+    ) as client:
+        transport = HttpxTransport(
+            client, response_adapter=adapt, token_providers={"identity": Provider()}, observers=(Observer(),)
+        )
+        with pytest.raises(httpx.HTTPStatusError) as failure:
+            await perform(transport, streaming, RequestSpec("GET", "/value", security=bindings if managed else None))
+    error = failure.value
+    assert len(sent) == len(originals) == body.closes == 1
+    assert error.response is responses[0]
+    assert error.response.status_code == 403
+    assert error.response.headers["x-detail"] == "preserved"
+    assert error.response.http_version == "HTTP/1.1"
+    assert error.response.is_closed
+    if buffered:
+        assert error.response.content == b"original body"
+    else:
+        assert body.reads == 0
+    assert len(observed) == (1 if stage == "hook" else 0)
+    if managed and not stop:
+        for diagnostic in [error, *observed]:
+            assert type(diagnostic) is httpx.HTTPStatusError
+            assert str(diagnostic) == "HTTP request failed"
+            assert diagnostic.request.headers["authorization"] == "[redacted]"
+            assert diagnostic.request.url.params["api_key"] == "[redacted]"
+            assert diagnostic.request.headers["cookie"] == "[redacted]"
+            assert diagnostic.response.request is diagnostic.request
+        assert error is not originals[0]
+        assert error.__cause__ is None and error.__suppress_context__
+    else:
+        assert error is originals[0]
+        assert all(item is error for item in observed)
+    if managed:
         assert sent[0].headers["authorization"] == "Bearer token-1"
         assert sent[0].url.params["api_key"] == "token-2"
         assert sent[0].headers["cookie"] == "session=token-3"
-    else:
-        assert error is errors[0]
+        if stop:
+            assert error.request is sent[0]
+            assert error.response.request is sent[0]

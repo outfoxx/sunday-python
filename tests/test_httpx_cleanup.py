@@ -1715,3 +1715,96 @@ async def test_transport_shutdown_recognizes_response_cleanup_callbacks(
             release.set()
             await asyncio.gather(*closers, return_exceptions=True)
             await transport.aclose()
+
+
+@pytest.mark.parametrize("eager", [False, True], ids=["deferred", "eager"])
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("failure_kind", ["none", "stop", "cancelled"])
+async def test_event_source_startup_shutdown_waits_for_registered_run(
+    server: Server, eager: bool, owned: bool, failure_kind: str
+) -> None:
+    opened, entered, release = (anyio.Event() for _ in range(3))
+    original = (
+        Stop("original startup stop")
+        if failure_kind == "stop"
+        else asyncio.CancelledError("original startup cancellation")
+        if failure_kind == "cancelled"
+        else None
+    )
+    errors: list[BaseException | None] = []
+    cancellations: list[asyncio.CancelledError] = []
+
+    async def adapt(request: httpx.Request) -> httpx.Request:
+        if request.url.path == "/shutdown":
+            with anyio.CancelScope(shield=True):
+                # No suspension before shutdown: eager startup must already be registered.
+                await transport.aclose()
+                entered.set()
+                await release.wait()
+                if original is not None:
+                    raise original
+        return request
+
+    async def close_externally() -> None:
+        try:
+            await transport.aclose()
+        except asyncio.CancelledError as error:
+            cancellations.append(error)
+            raise
+
+    async with httpx.AsyncClient(base_url=server.url, trust_env=False) as client:
+        transport = HttpxTransport(
+            None if owned else client, base_url=server.url if owned else None, request_adapter=adapt
+        )
+        peer = transport.event_source(RequestSpec("GET", "/events"))
+        peer.on_message = lambda event: opened.set()
+        peer.connect()
+        source = transport.event_source(RequestSpec("GET", "/shutdown"))
+        source.on_error = errors.append
+        loop = asyncio.get_running_loop()
+        previous = loop.get_task_factory()
+        closers: list[asyncio.Task[None]] = []
+        try:
+            with anyio.fail_after(3):
+                await opened.wait()
+                loop.set_task_factory(asyncio.eager_task_factory if eager else None)
+                source.connect()
+                (run,) = source._tasks
+                await entered.wait()
+                await peer._wait_closed()
+                await server.disconnected.wait()
+                closers = [asyncio.create_task(close_externally()), asyncio.create_task(transport.aclose())]
+                done, _ = await asyncio.wait(closers, timeout=0.02)
+                assert not done
+                assert not run.done()
+                assert source in transport._event_sources
+                assert not transport.client.is_closed
+                closers[0].cancel("first shutdown cancellation")
+                await anyio.sleep(0)
+                closers[0].cancel("later shutdown cancellation")
+                await anyio.sleep(0)
+                assert all(not task.done() for task in closers)
+                release.set()
+                with pytest.raises(asyncio.CancelledError) as failure:
+                    await closers[0]
+                assert failure.value is cancellations[0]
+                assert failure.value.args == ("first shutdown cancellation",)
+                await closers[1]
+                assert run.done()
+                if failure_kind == "cancelled":
+                    with pytest.raises(asyncio.CancelledError) as failure:
+                        run.result()
+                    assert failure.value is original
+                else:
+                    run.result()
+                assert errors == ([original] if failure_kind == "stop" else [])
+                assert not source._tasks and not peer._tasks
+                assert transport.client.is_closed is owned
+                if not owned:
+                    assert (await client.get("/after")).status_code == 204
+        finally:
+            loop.set_task_factory(previous)
+            release.set()
+            await asyncio.gather(*closers, return_exceptions=True)
+            await source._wait_closed()
+            await transport.aclose()

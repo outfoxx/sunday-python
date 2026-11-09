@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import anyio
@@ -46,7 +46,6 @@ class HttpxEventStream[EventT]:
         """Completion of an I/O block, independent of the consumer's lifetime."""
 
         scope: anyio.CancelScope
-        task: asyncio.Task[Any] | None = field(default_factory=asyncio.current_task)
         done: anyio.Event = field(default_factory=anyio.Event)
 
     def __init__(
@@ -113,9 +112,7 @@ class HttpxEventStream[EventT]:
         active = self._active_io
         # Callbacks cannot join the I/O or cleanup waiting for them to return.
         # Keep the response reference so external callers still join its cleanup.
-        if (active is not None and any(owner is active for owner in _io_owners.get())) or (
-            self._response is not None and in_response_cleanup(self._response)
-        ):
+        if self._owns_current_work():
             return
         try:
             if active is None:
@@ -126,6 +123,11 @@ class HttpxEventStream[EventT]:
             if error is None:
                 raise
             error.add_note("Closing the HTTP response also failed")
+
+    def _owns_current_work(self) -> bool:
+        return (self._active_io is not None and any(owner is self._active_io for owner in _io_owners.get())) or (
+            self._response is not None and in_response_cleanup(self._response)
+        )
 
     async def _finish_close(self, active: _IO) -> None:
         await active.done.wait()
@@ -409,9 +411,7 @@ class HttpxEventSource:
     def _owns_current_work(self) -> bool:
         # Cleanup can outlive the I/O block. Retain each run's stream so callbacks
         # from retiring runs are recognized as well as the current run's callbacks.
-        return any(owner.task in self._tasks and not owner.done.is_set() for owner in _io_owners.get()) or any(
-            stream._response is not None and in_response_cleanup(stream._response) for stream in self._tasks.values()
-        )
+        return any(stream._owns_current_work() for stream in self._tasks.values())
 
     async def _wait_closed(self) -> None:
         if self._tasks:
@@ -419,6 +419,8 @@ class HttpxEventSource:
 
     async def _run(self, stream: HttpxEventStream[ServerSentEvent]) -> None:
         try:
+            # Register the run before callbacks can request shutdown, even with an eager task factory.
+            await asyncio.sleep(0)
             if not stream._closed:
                 async with stream:
                     async for event in stream:

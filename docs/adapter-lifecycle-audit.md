@@ -57,11 +57,13 @@ I/O block has a completion event paired with its cancel scope. External close ca
 block before response cleanup, even when no response has yet been handed to the stream. I/O
 ownership is cleared before yielding events, so close never joins application work between events.
 Callbacks within the same I/O ownership chain only request closure to avoid waiting on themselves.
-Each I/O record identifies its initiating task, so transport shutdown can recognize an owned
-EventSource callback even inside a native child task or a retiring run. Shutdown signals source
-closure immediately; reentrant callers do not join their own run, while external callers still
-join the shared cleanup. The transport owns one shutdown task. EventSource retirement uses `asyncio.wait()` to join source tasks without
-confusing independently cancelled sources with cancellation of the shutdown caller. There is no
+Each EventSource retains its active and retiring streams. Stream close and transport shutdown
+use the same stream ownership check for active I/O and response cleanup, including native child
+tasks. A startup checkpoint registers each run before callbacks can execute under an eager task
+factory. Shutdown signals source closure immediately; reentrant callers do not join their own
+run, while external callers still join the shared cleanup. The transport owns one shutdown task.
+EventSource retirement uses `asyncio.wait()` to join source tasks without confusing independently
+cancelled sources with cancellation of the shutdown caller. There is no
 new public adapter API, request-attached state, retry policy, custom dispatcher or HTTP stack.
 
 Bulk response collection uses one native I/O owner task for the complete `aread()`. A task-local
@@ -85,7 +87,9 @@ actual task, so child tasks inheriting context do not incorrectly bypass protect
 | EventSource shutdown and immediate reconnect | Run-local streams; native task join includes retiring runs | TCP reconnect and retirement tests |
 | Transport shutdown | Shared completion, owned client closed only after sources finish; active owned callbacks request shutdown without self-joining | TCP owned/borrowed client, concurrent shutdown, independently cancelled source, scope/raw cancellation, request/response adapter and native-hook reentrancy, retiring runs, stop and external cancellation identity |
 | Transport context cleanup fails during an existing error | Cleanup adds a note; original object propagates | Stop, CancelledError and ordinary-error identity tests |
-| Token acquisition and persistence | Waiter counting remains separate from the shared renewal task | Coalescing, last-waiter cancellation, persistence-after-cancellation and duplicate-report tests |
+| Token acquisition and persistence | Waiter counting remains separate from the shared renewal task | Eager/deferred acquisition and refresh, coalescing, last-waiter cancellation, persistence-after-cancellation and duplicate-report tests |
+| EventSource startup | Run registration precedes callbacks under eager and deferred task factories | TCP peer cleanup, reentrant startup shutdown, external close waiting, and stop/native cancellation identity |
+| Managed diagnostic errors | One policy redacts HTTPX request and status errors; stop signals retain identity | Request adapters, native sends/hooks, response adapters and collection; buffered/streaming execution, credential redaction, status/body/metadata preservation, and cancellation/unmanaged identity |
 
 The TCP cancellation cases use HTTPX's documented trace extension to hold an actual httpcore
 cleanup operation open. They then cancel again and verify completion, original error identity or
