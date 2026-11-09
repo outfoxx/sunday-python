@@ -370,13 +370,10 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                 return response
             except BaseException as error:
                 await close_response(response, error)
-                if (
-                    authorized is not None
-                    and authorized.bindings
-                    and isinstance(error, httpx.RequestError)
-                    and not isinstance(error, RequestCancellationError)
-                ):
-                    raise type(error)("HTTP request failed", request=authorized.diagnostic_request(effective)) from None
+                if authorized is not None:
+                    diagnostic_error = authorized.diagnostic_error(error, effective)
+                    if diagnostic_error is not error:
+                        raise diagnostic_error from None
                 raise
 
     async def _send_httpx(
@@ -409,12 +406,8 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                     discard=close_response,
                 )
         except BaseException as error:
-            if (
-                diagnostic is not request
-                and isinstance(error, httpx.RequestError)
-                and not isinstance(error, RequestCancellationError)
-            ):
-                error = type(error)("HTTP request failed", request=diagnostic)
+            if security is not None:
+                error = security.diagnostic_error(error, request)
             try:
                 self._observe(
                     TransportEvent(

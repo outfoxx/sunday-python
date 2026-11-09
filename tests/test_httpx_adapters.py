@@ -803,11 +803,14 @@ async def test_redirect_history_collection_preserves_stop_identity(streaming: bo
     assert sends == body.reads == body.closes == 1
 
 
-@pytest.mark.parametrize(("stage", "streaming"), [("adapter", False), ("adapter", True), ("collection", False)])
+@pytest.mark.parametrize(
+    ("stage", "streaming"),
+    [("send", False), ("send", True), ("adapter", False), ("adapter", True), ("collection", False)],
+)
 @pytest.mark.parametrize("bound_error", [False, True])
 @pytest.mark.parametrize("stop", [False, True])
 @pytest.mark.parametrize("managed", [True, False])
-async def test_managed_read_errors_sanitize_diagnostics_without_rewriting_stop_errors(
+async def test_managed_errors_sanitize_diagnostics_without_rewriting_stop_errors(
     stage: str, streaming: bool, bound_error: bool, stop: bool, managed: bool
 ) -> None:
     provider = Provider()
@@ -826,6 +829,8 @@ async def test_managed_read_errors_sanitize_diagnostics_without_rewriting_stop_e
             f"Read failed for {request.url}: {request.headers}", request=request if bound_error else None
         )
         errors.append(error)
+        if stage == "send":
+            raise error
         body = Body(error=error)
         bodies.append(body)
         return httpx.Response(200, stream=body)
@@ -846,7 +851,7 @@ async def test_managed_read_errors_sanitize_diagnostics_without_rewriting_stop_e
             await perform(transport, streaming, RequestSpec("GET", "/value", security=bindings if managed else None))
     error = failure.value
     assert len(sent) == 1
-    assert bodies[0].closes == 1
+    assert [body.closes for body in bodies] == ([] if stage == "send" else [1])
     if managed and not stop:
         assert type(error) is httpx.ReadError
         assert error is not errors[0]

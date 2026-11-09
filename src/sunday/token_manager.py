@@ -164,6 +164,8 @@ class TokenManager:
                 self._locks.pop(key, None)
 
     async def _renew(self, key: str, provider: TokenProvider, request: TokenRequest) -> TokenLease:
+        # Register the renewal and its waiters before work starts, even with an eager task factory.
+        await asyncio.sleep(0)
         authorization_key = hashlib.sha256(key.encode()).digest()
         try:
             async with self._exclusive(key):

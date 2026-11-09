@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 import httpx
 
+from ..request_cancellation_error import RequestCancellationError
 from ..security import SecurityBinding
 from ..token_provider import TokenLease, TokenProvider, TokenProviderError, provider_credentials
 from ._requests import copy_request
@@ -85,6 +86,12 @@ class RequestSecurity:
             and (binding.transport.prefix or "").lower() == "bearer"
             and _bearer_token(request) == lease.tokens.access_token
         )
+
+    def diagnostic_error(self, error: BaseException, request: httpx.Request) -> BaseException:
+        """Sanitize managed HTTPX failures while preserving cancellation identity."""
+        if self.bindings and isinstance(error, httpx.RequestError) and not isinstance(error, RequestCancellationError):
+            return type(error)("HTTP request failed", request=self.diagnostic_request(request))
+        return error
 
     def diagnostic_request(self, request: httpx.Request) -> httpx.Request:
         """Remove managed credentials from native error/response diagnostics."""

@@ -4,6 +4,8 @@
 # you may not use this file except in compliance with the License.
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import Literal, cast
 
@@ -435,3 +437,72 @@ async def test_abandoned_persistence_failure_is_retrieved_without_duplicate_loop
     finally:
         finish.set()
         loop.set_exception_handler(previous)
+
+
+@contextmanager
+def _task_factory(eager: bool) -> Iterator[None]:
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    loop.set_task_factory(asyncio.eager_task_factory if eager else None)
+    try:
+        yield
+    finally:
+        loop.set_task_factory(previous)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("eager", [False, True], ids=["deferred", "eager"])
+@pytest.mark.parametrize("refresh", [False, True], ids=["acquire", "refresh"])
+async def test_immediate_renewal_is_registered_before_persistence(eager: bool, refresh: bool) -> None:
+    provider = Provider()
+    now = 0.0
+    manager = TokenManager(provider, now=lambda: now)
+    if refresh:
+        await manager.credentials(BINDING)
+        now = 71
+        provider.tokens = TokenSet("second", 200, "refresh-second")
+    with _task_factory(eager):
+        first, second = await asyncio.gather(manager.credentials(BINDING), manager.credentials(BINDING))
+        assert first.tokens == second.tokens == provider.tokens
+        assert (await manager.credentials(BINDING)).tokens == provider.tokens
+    assert len(provider.acquisitions) == 1
+    assert provider.refreshes == (["refresh-first"] if refresh else [])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("eager", [False, True], ids=["deferred", "eager"])
+@pytest.mark.parametrize("refresh", [False, True], ids=["acquire", "refresh"])
+@pytest.mark.parametrize("native", [False, True], ids=["stop", "cancelled"])
+async def test_immediate_renewal_cancellation_preserves_identity(eager: bool, refresh: bool, native: bool) -> None:
+    error = asyncio.CancelledError("cancel renewal") if native else RequestCancellationError("stop renewal")
+
+    class StoppingProvider(Provider):
+        failure: BaseException | None = None
+
+        async def acquire(self, request: TokenRequest) -> TokenSet:
+            if self.failure is not None:
+                raise self.failure
+            return await super().acquire(request)
+
+        async def refresh(self, request: TokenRequest, refresh_token: str) -> TokenSet:
+            if self.failure is not None:
+                raise self.failure
+            return await super().refresh(request, refresh_token)
+
+    provider = StoppingProvider()
+    now = 0.0
+    manager = TokenManager(provider, now=lambda: now)
+    if refresh:
+        await manager.credentials(BINDING)
+        now = 71
+    provider.failure = error
+    with _task_factory(eager):
+        with pytest.raises(type(error)) as failure:
+            await manager.credentials(BINDING)
+        assert failure.value is error
+        # A failed renewal must not poison the next acquisition or refresh.
+        provider.failure = None
+        provider.tokens = TokenSet("recovered", 200)
+        assert (await manager.credentials(BINDING)).tokens.access_token == "recovered"
+    assert len(provider.acquisitions) == 1
+    assert provider.refreshes == (["refresh-first"] if refresh else [])
