@@ -5,9 +5,16 @@
 
 """Application credential acquisition and storage contracts."""
 
-from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from __future__ import annotations
 
+import asyncio
+import math
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, fields
+from time import time
+from typing import Literal, Protocol, cast
+
+from .request_cancellation_error import RequestCancellationError
 from .security import SecurityBinding, SecurityEndpoints
 
 
@@ -78,7 +85,7 @@ class TokenStore(Protocol):
         ...
 
 
-class AuthorizationRequiredError(Exception):
+class AuthorizationRequiredError(RequestCancellationError):
     """The application must obtain fresh authorization and supply a new grant identity."""
 
     def __init__(self) -> None:
@@ -91,3 +98,80 @@ class TokenProviderError(Exception):
     def __init__(self, reason: Literal["unavailable", "temporary", "invalid_grant"] = "unavailable") -> None:
         self.reason = reason
         super().__init__("The credential provider could not supply usable credentials")
+
+
+class TokenRejectedError(RequestCancellationError):
+    """The credential owner declined automatic recovery of a rejected token."""
+
+    def __init__(self) -> None:
+        super().__init__("The credential owner requires application recovery")
+
+
+@dataclass(frozen=True, slots=True)
+class TokenLease:
+    """Receipt retaining only the original credential's rejection context."""
+
+    key: str = field(repr=False)
+    tokens: TokenSet = field(repr=False)
+    rejection: Callable[[], Awaitable[bool]] | None = field(default=None, repr=False, compare=False)
+
+    async def invalidate(self) -> bool:
+        """Reject this credential through its owner, preserving concurrent replacements."""
+        try:
+            return await self.rejection() if self.rejection is not None else False
+        except (RequestCancellationError, TokenProviderError):
+            raise
+        except Exception:
+            raise TokenProviderError() from None
+
+
+class RejectingTokenProvider(TokenProvider, Protocol):
+    """Optional capability for external frameworks that own rejection recovery."""
+
+    async def reject(self, request: TokenRequest, rejected_token: str) -> bool:
+        """Reject only this token in its original session; return false if recovery is unsupported."""
+        ...
+
+
+async def provider_credentials(provider: TokenProvider, binding: SecurityBinding) -> TokenLease:
+    """Acquire once without adding a token cache or managing refresh credentials."""
+    await asyncio.sleep(0)
+    credentials = getattr(provider, "credentials", None)
+    if callable(credentials):
+        return cast(TokenLease, await credentials(binding))
+    try:
+        request = _resolve_token_request(provider, binding)
+        tokens = await provider.acquire(request)
+        await asyncio.sleep(0)
+        if not tokens.access_token or (
+            tokens.expires_at is not None and (not math.isfinite(tokens.expires_at) or tokens.expires_at <= time())
+        ):
+            raise TokenProviderError()
+
+        async def reject() -> bool:
+            hook = getattr(provider, "reject", None)
+            return bool(await hook(request, tokens.access_token)) if callable(hook) else False
+
+        return TokenLease("", tokens, reject)
+    except (RequestCancellationError, TokenProviderError):
+        raise
+    except Exception:
+        raise TokenProviderError() from None
+
+
+def _resolve_token_request(provider: TokenProvider, binding: SecurityBinding) -> TokenRequest:
+    """Resolve provider configuration without applying cache or grant-reuse policy."""
+    config = provider.configure(binding)
+    if not provider.identity.strip() or not config.client_identity.strip():
+        raise TokenProviderError()
+    values = {item.name: getattr(binding, item.name) for item in fields(SecurityBinding)}
+    if config.endpoints is not None:
+        values.update(
+            {
+                item.name: value
+                for item in fields(config.endpoints)
+                if (value := getattr(config.endpoints, item.name)) is not None
+            }
+        )
+    values["scopes"] = tuple(sorted(set(binding.scopes)))
+    return TokenRequest(**values, client_identity=config.client_identity, grant_identity=config.grant_identity)

@@ -1,22 +1,20 @@
 """Application-owned manager storage survives settings instances without eager I/O."""
 
 import asyncio
-from collections.abc import Mapping
 from dataclasses import replace
 
 import pytest
 
 from sunday import (
-    BearerCredentials,
     ClientSettings,
     ProviderCredentials,
     SecurityBinding,
     SecurityTransport,
     TokenConfiguration,
     TokenManager,
-    TokenProvider,
     TokenRequest,
     TokenSet,
+    provider_credentials,
 )
 
 BINDING = SecurityBinding(
@@ -74,33 +72,30 @@ def test_persisted_sessions_rotation_isolation_and_logout() -> None:
 
             provider = Provider()
 
-            def factory(providers: Mapping[str, TokenProvider]) -> TokenManager:
-                nonlocal factories
-                factories += 1
-                assert dict(providers) == {"resolved-provider": provider}
-                return TokenManager(providers, store=store, expiry_skew=5, now=lambda: time)
+            nonlocal factories
+            factories += 1
+            manager = TokenManager(provider, store=store, expiry_skew=5, now=lambda: time)
 
             selected = replace(BINDING, profile=profile)
-            credentials = {"identity": ProviderCredentials(provider)}
+            credentials = {"identity": ProviderCredentials(manager)}
             if direct:
-                return ClientSettings(
-                    "https://api.example", {"read": [selected]}, credentials, token_manager_factory=factory
-                )
+                return ClientSettings("https://api.example", {"read": [selected]}, credentials)
             return ClientSettings.resolve(
                 "https://api.example",
                 {"read": [[selected]], "other": [[selected]], "public": [[]]},
                 credentials,
-                token_manager_factory=factory,
             )
 
         async def token(settings: ClientSettings) -> TokenSet:
-            assert settings.token_manager is not None
-            return (await settings.token_manager.credentials(settings.bindings["read"][0])).tokens
+            assert settings.token_providers
+            return (
+                await provider_credentials(settings.token_providers["resolved-provider"], settings.bindings["read"][0])
+            ).tokens
 
         first = settings(0)
         assert (reads, saves, acquisitions, factories) == (0, 0, 0, 1)
-        assert first.token_manager is not None
-        lease = await first.token_manager.credentials(first.bindings["read"][0])
+        assert first.token_providers
+        lease = await provider_credentials(first.token_providers["resolved-provider"], first.bindings["read"][0])
         assert lease.tokens.access_token == "initial"
         assert (await token(settings(0, direct=True))).access_token == "initial"
         assert acquisitions == 1
@@ -122,21 +117,8 @@ def test_persisted_sessions_rotation_isolation_and_logout() -> None:
     asyncio.run(run())
 
 
-def test_public_invalid_and_failing_factory() -> None:
-    def factory(providers: Mapping[str, TokenProvider]) -> TokenManager:
-        raise RuntimeError("application factory failed")
-
-    assert ClientSettings("https://api.example", token_manager_factory=factory).token_manager is None
-    assert (
-        ClientSettings.resolve("https://api.example", {"public": [[]]}, {}, token_manager_factory=factory).token_manager
-        is None
-    )
+def test_public_settings_and_missing_credentials() -> None:
+    assert not ClientSettings("https://api.example").token_providers
+    assert not ClientSettings.resolve("https://api.example", {"public": [[]]}, {}).token_providers
     with pytest.raises(ValueError, match="Missing credentials"):
-        ClientSettings("https://api.example", {"read": [BINDING]}, token_manager_factory=factory)
-    with pytest.raises(RuntimeError, match="application factory failed"):
-        ClientSettings(
-            "https://api.example",
-            {"read": [replace(BINDING, flow="static")]},
-            {"identity": BearerCredentials("secret")},
-            token_manager_factory=factory,
-        )
+        ClientSettings("https://api.example", {"read": [BINDING]})

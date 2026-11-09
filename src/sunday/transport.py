@@ -61,6 +61,10 @@ class Transport[TransportRequestT, TransportResponseT](ProblemRegistrar, Protoco
         """Send a native request and return the native response."""
         ...
 
+    async def execute_request(self, spec: RequestSpec[Any]) -> TransportResponseT:
+        """Execute a specification with transport-owned authorization and recovery."""
+        ...
+
     async def response[ResponseT](
         self,
         spec: OperationSpec[Any, ResponseT],
@@ -120,13 +124,16 @@ class BaseTransport[TransportRequestT, TransportResponseT](ABC):
         """Send a native request and return the native response."""
         return await self._send(request)
 
+    async def execute_request(self, spec: RequestSpec[Any]) -> TransportResponseT:
+        """Execute a specification without exporting its internal request state."""
+        return await self.transport_response(await self._prepare_request(spec))
+
     async def response[ResponseT](
         self,
         spec: OperationSpec[Any, ResponseT],
     ) -> OperationResponse[ResponseT, TransportResponseT]:
         """Execute an operation and return its decoded response with metadata."""
-        request = await self.transport_request(spec.request)
-        response = await self.transport_response(request)
+        response = await self.execute_request(spec.request)
         decoded = await self._decode_response(response, spec.responses)
         return cast(OperationResponse[ResponseT, TransportResponseT], decoded)
 

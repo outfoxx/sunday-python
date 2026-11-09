@@ -90,8 +90,9 @@ Sunday transports expose the same high-level workflow as the Kotlin, Swift, and 
 | Decode result only | `result()` |
 
 `BaseTransport` implements this orchestration for custom adapters. Implementations provide protected `_prepare_request()`,
-`_send()`, and `_decode_response()` hooks. Preparation applies ordered request adapters once; generated request- and
-response-exchange methods are async and return the exact adapted request or native response used by execution.
+`_send()`, and `_decode_response()` hooks. HTTPX preparation only builds the request; managed execution adapts immediately before each send.
+Request export adapts once and hands execution to the consumer (for example, `await client.send(exported)`).
+Calling `transport_response()` explicitly starts a new managed execution and applies its adapters.
 
 Generated clients expose their `transport`, `default_content_types`, and `default_accept_types`. Operation-specific media
 declarations take precedence when they cannot use the client defaults, and an explicit Content-Type header remains
@@ -100,7 +101,7 @@ authoritative.
 ## Profiled credentials
 
 Generated operations carry selected `SecurityBinding` metadata in `RequestSpec.security`. Applications
-register providers on a shared `TokenManager` and pass it to `HttpxTransport(token_manager=...)`.
+pass named providers directly to `HttpxTransport(token_providers=...)`.
 Providers and token storage stay in the application; generated code contains no credentials.
 
 ```python
@@ -120,7 +121,7 @@ def create_transport(client: httpx.AsyncClient, client_secret: str) -> HttpxTran
     )
     return HttpxTransport(
         client,
-        token_manager=TokenManager({"service-identity": provider}),
+        token_providers={"service-identity": TokenManager(provider)},
     )
 ```
 
@@ -219,7 +220,8 @@ Typed `EventStream[T]` values retain the async-iterator lifecycle. Raw `EventSou
 a running AsyncIO loop: assign `on_open`, `on_error`, or `on_message`, register event-specific listeners, call `connect()`,
 and call `close()` when finished. `connect()` returns immediately in the connecting state. The source exposes
 `ready_state` and its current `retry_time`; closing is idempotent and immediately changes the state to closed while
-response cleanup completes on the loop.
+response cleanup completes on the loop. Calling `connect()` immediately after `close()` starts
+a new run with its own stream; transport shutdown also waits for any retiring runs.
 
 HTTPX applications can construct a raw source from a declarative request with `HttpxTransport.event_source()` or from a
 synchronous or asynchronous native request factory with `event_source_from()`. Reconnect requests receive the SSE headers
@@ -286,33 +288,135 @@ is a typed, copyable, picklable singleton; it is omitted from JSON Schema and se
 field configuration above. A literal string `"UNSET"` remains an ordinary string value. Keep the
 `default_factory` and `exclude_if` configuration when defining patch models manually.
 
-## Application-owned token persistence
+## Application-owned token lifecycle
+
+Transports accept named `TokenProvider` instances directly. Settings preserve supplied providers and
+never add a token cache. Every managed network attempt asks its provider for current credentials.
+An external framework (for example Auth0) remains responsible for storage, renewal and logout.
+Return only its access token and optional expiry; keep its refresh token inside that framework.
+
+For Sunday's caching and refresh lifecycle, explicitly supply a `TokenManager` as the provider:
 
 ```python
+tokens = TokenManager(oauth_provider, store=application_store, expiry_skew=30, now=application_clock)
 settings = ClientSettings.resolve(
-    base_url, alternatives, credentials,
-    token_manager_factory=lambda providers: TokenManager(
-        providers, store=application_store, expiry_skew=30, now=application_clock,
-    ),
+    base_url, alternatives, {"identity": ProviderCredentials(tokens)},
+)
+# Supply an external framework's provider directly instead to keep its lifecycle authoritative.
+transport = HttpxTransport.from_settings(settings, client)
+```
+
+Managers retain expiry skew, coalesced renewal, refresh rotation and application-selected persistence.
+Use a manager on one asyncio loop; cancel and await requests before discarding it.
+Transport closure does not erase the store or close a shared provider. Separate managers do not
+coordinate refreshes merely because they share a store. Reuse the same manager across clients that
+share a credential lifecycle, and distinguish users/environments with provider and grant identities.
+
+Providers can implement `reject` to handle an invalid bearer token. It receives the original request
+context and rejected access token, and returns whether recovery can proceed. Compare the rejected
+credential with the current session before renewing: a late rejection must not invalidate a newer token
+or a new login. Providers without this capability raise `TokenRejectedError`, a `RequestCancellationError`, on explicit invalid-token rejection. Acquisition and rejection
+must not start interactive login automatically; return an authorization-required failure to the caller.
+For an Auth0 adapter, retrieve through its credentials manager and force renewal through that same
+manager on rejection, serializing concurrent rejection handling without maintaining a second token cache.
+
+Request export materializes an optionally authorized native request once and hands its lifecycle to
+the consumer. Exported requests retain no Sunday-managed recovery state. Executing an operation through
+Sunday acquires once per attempt and retains the bounded safe-request recovery and SSE reconnect budget.
+
+Migration: replace transport `tokenManager`/`token_manager` arguments with named
+`tokenProviders`/`token_providers` maps. Replace `TokenManagerFactory` hooks with explicitly constructed
+managers supplied through provider credentials. Direct built-in OAuth providers are not implicitly cached;
+wrap them explicitly when Sunday should retain and refresh their tokens. For logout, stop outstanding
+requests and settle refresh commits before clearing the owning framework's or application's storage.
+
+Custom transports implementing the `Transport` protocol must provide `execute_request(spec)` for
+operation execution. `BaseTransport` implements it through `_prepare_request` and `_send`.
+Keep `transport_request(spec)` as the caller-owned export path; do not route operation execution
+through an export override.
+
+
+## Request and response adapters
+
+`RequestAdapter` and `ResponseAdapter` are independent ABCs in `sunday.httpx`. Implement
+`async adapt(request) -> httpx.Request` or `async adapt(response, request) -> httpx.Response`.
+Each provides `chain_to(next_adapter)`. `RequestAdapters` and `ResponseAdapters` also accept
+async functions and flatten nested chains once at construction:
+
+```python
+from sunday.httpx import HttpxTransport, RequestAdapters, ResponseAdapters, copy_request
+
+async def add_header(request):
+    return copy_request(request, headers=[*request.headers.multi_items(), ("X-Client", "example")])
+
+async def inspect_response(response, request):
+    # Headers are available before Sunday reads the body.
+    return response
+
+transport = HttpxTransport(
+    client,
+    request_adapter=RequestAdapters(add_header),
+    response_adapter=ResponseAdapters(inspect_response),
 )
 ```
 
-The same optional `token_manager_factory: TokenManagerFactory | None` keyword is available on the
-settings initializer. Clock values and expiry skew are seconds. Use the manager on its application's
-asyncio loop. The native manager has no close/reset method: cancel/await application requests and
-discard the manager at session end; it does not own HTTPX clients or close application storage.
+Managed attempts prepare and authorize, adapt the request, send, adapt the response, then
+apply normal response handling and bounded recovery. No response capability is inferred from
+a request adapter. Provider rejection feedback is independent of custom response adapters and
+runs even for unsafe methods or exhausted retry budgets. Only the token actually sent is rejected.
+Security receipts and retry counts are local to execution, never attached to exported requests.
 
-The hook is invoked once with the resolved provider map, after security validation, and is skipped
-when no providers are selected. It must only construct a manager: do not acquire tokens or read
-storage in the hook. Omitting it keeps the existing in-memory default. Settings retain the returned
-manager, not the factory. All operations on those settings share it; generated aggregate children
-therefore retain the same cache and single-flight renewal. Independently created managers do not
-coordinate concurrent refreshes, even if their stores are the same. Reuse a client/aggregate within
-an active session; use successive managers to reopen saved sessions.
+Adapters surround each native HTTPX call. Borrowed-client event hooks, authentication flows,
+and transport-level connection recovery retain their native behavior; intermediate native
+responses are not guaranteed to reach Sunday adapters. Credentialed calls suppress native auth.
+Sunday handles allowed redirects after response adaptation, rerunning request adapters on each
+follow-up without accumulating header mutations. Buffered bodies and `StreamingBody` factories
+can be replayed for redirects; arbitrary one-shot request streams are not replayed. Credentialed
+redirects remain disabled. Allowed follow-ups use the native cookie jar, including its domain,
+path, and secure-cookie rules. Returned responses retain redirect and native authentication
+history; intermediate redirect bodies are buffered as in HTTPX, including during streaming
+execution. Native clients and connection pools are reused without reconfiguration.
 
-The application owns persistence, encryption, store access and session boundaries. Provider/client,
-grant, profile and endpoint identities must distinguish environments and users; the API base URL
-alone is not an implicit store namespace. Use a new grant identity for a fresh authorization session.
-For logout, stop requests and wait for pending refresh/persistence to finish before removing the
-session's store entries, then construct fresh settings. `invalidate` expires an access token for
-renewal; it is not logout and deliberately retains refresh state. No disk storage is enabled automatically.
+An adapter that consumes or replaces a resource must close it and provide a replacement.
+HTTPX responses and headers are mutable; `await response.aread()` retains buffered content for
+subsequent readers. Return a new `httpx.Response` to replace the body. `copy_request()` preserves
+native extensions and shares an unread stream without consuming it; pass `content=b""` to remove
+a body. Changing the URL authority updates `Host` unless the supplied `headers` explicitly
+override it. Replacing headers preserves an unchanged body's framing unless `Content-Length` or
+`Transfer-Encoding` is explicitly supplied. Buffering a chunked upload before copying it retains
+chunked framing without adding `Content-Length`; streams without known framing use chunked encoding.
+Use asynchronous streams; synchronous factories must not block the event loop.
+
+Subclass `sunday.RequestCancellationError` to veto retries and SSE reconnects. Sunday propagates
+the original exception, including when it also subclasses an HTTPX error or `Problem`; encoding
+fallbacks and nullable operations never suppress it. This is distinct from
+`asyncio.CancelledError`: task cancellation follows Python semantics and is never swallowed.
+Cleanup waits for the response to close even when asyncio cancellation is pending or repeated,
+then propagates the original error. A cleanup failure does not replace an existing failure.
+Explicit closure and HTTPX's automatic EOF closure share one protected stream-close operation;
+concurrent closers join it until it finishes. Native sends and reads run behind a cancellation
+boundary that allows HTTPX/httpcore to finish internal cleanup before the original cancellation
+is rethrown. This also covers OAuth discovery and token exchanges. Transport shutdown shares
+one completion task across callers and waits for retiring EventSource runs before closing an
+owned client. A cancelled shutdown waiter does not cancel that shared cleanup. When an owned
+EventSource's adapter, native hook, or response-cleanup callback calls `transport.aclose()`, it
+requests shutdown without joining its own run; external callers still wait for cleanup to finish.
+This also applies to retiring runs after an immediate reconnect.
+Buffered collection uses HTTPX's bulk `aread()` with one owner task for the entire body; SSE uses
+its asynchronous byte iterator with cancellation bounded to each read.
+Use `async with stream` or explicitly await `stream.aclose()` when ending iteration early.
+Closing a stream interrupts and joins its active I/O, including header reception and response
+adaptation before the stream receives the response. It then joins response cleanup without waiting
+for application work between yielded events. Context cleanup preserves the consumer's original
+exception if cleanup fails. A close called inside that stream's own adapter, native hook, or
+response-cleanup callback requests closure without waiting on itself; external close callers
+wait for completion, including when callbacks delegate work to child tasks.
+
+The existing `adapters=` argument remains supported for legacy `(transport, request)` adapters;
+it runs before the new request-adapter chain. Prefer the independent `request_adapter=` and
+`response_adapter=` arguments for new code. Generated code continues to use managed
+`execute_request()`/`response()` operations; generator migration is a separate step.
+
+
+The [adapter lifecycle audit](docs/adapter-lifecycle-audit.md) records the recurring failure
+patterns, native-framework boundaries, and regression coverage used for this refactor.

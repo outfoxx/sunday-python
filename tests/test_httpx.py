@@ -215,7 +215,7 @@ async def test_transport_request_selects_supported_media_and_applies_adapters_on
                 accept_types=(MediaType("application/xml"), MediaType("application/json")),
             )
         )
-        await transport.transport_response(request)
+        await client.send(request)
 
     assert adaptations == 1
 

@@ -67,21 +67,25 @@ from .parameters import (
 from .patch import MergePatch, PatchDocument, PatchOperation, PatchOperationKind
 from .patch_model import SundayPatchModel
 from .problems import Problem, ProblemPayload, ProblemRegistry
+from .request_cancellation_error import RequestCancellationError
 from .security import SecurityBinding, SecurityEndpoints, SecurityTransport
 from .specs import NullifySpec, OperationSpec, RequestPayloadSpec, RequestSpec, ResponseHeaderSpec, ResponseSpec
 from .sse import EventParser, EventStreamOptions, ServerSentEvent
 from .streaming import StreamingBody, StreamingBodyChunk, StreamingBodyClose, StreamingBodyContent
-from .token_manager import TokenLease, TokenManager
-from .token_manager_factory import TokenManagerFactory
+from .token_manager import TokenManager
 from .token_provider import (
     AuthorizationRequiredError,
     RefreshingTokenProvider,
+    RejectingTokenProvider,
     TokenConfiguration,
+    TokenLease,
     TokenProvider,
     TokenProviderError,
+    TokenRejectedError,
     TokenRequest,
     TokenSet,
     TokenStore,
+    provider_credentials,
 )
 from .transport import BaseTransport, EventStream, ProblemRegistrar, Transport
 from .unknown_model import UnknownModel
@@ -144,6 +148,8 @@ __all__ = [
     "ProblemRegistry",
     "ProviderCredentials",
     "RefreshingTokenProvider",
+    "RejectingTokenProvider",
+    "RequestCancellationError",
     "RequestEncodingError",
     "RequestPayloadSpec",
     "RequestSpec",
@@ -169,9 +175,9 @@ __all__ = [
     "TokenConfiguration",
     "TokenLease",
     "TokenManager",
-    "TokenManagerFactory",
     "TokenProvider",
     "TokenProviderError",
+    "TokenRejectedError",
     "TokenRequest",
     "TokenSet",
     "TokenStore",
@@ -191,4 +197,5 @@ __all__ = [
     "is_unset",
     "parameter_object",
     "parameter_value",
+    "provider_credentials",
 ]

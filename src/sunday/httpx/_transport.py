@@ -5,13 +5,12 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping, Sequence
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from time import monotonic
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Protocol, TypeVar
-from weakref import WeakKeyDictionary
 
-import anyio
 import httpx
 
 from ..client_settings import ClientSettings
@@ -29,13 +28,19 @@ from ..observers import TransportEvent, TransportEventKind, TransportObserver, r
 from ..operations import OperationResponse
 from ..parameters import encode_parameters
 from ..problems import Problem, ProblemRegistry
+from ..request_cancellation_error import RequestCancellationError
 from ..specs import RequestSpec, ResponseSpec
 from ..sse import EventStreamOptions, ServerSentEvent
 from ..streaming import StreamingBody
-from ..token_manager import TokenManager
+from ..token_provider import TokenProvider, TokenRejectedError
 from ..transport import BaseTransport
 from ..uri import URITemplate
+from ._async import complete, run_io
+from ._requests import BodyStream, copy_request, is_credentialed, redirect_request
+from ._response_cleanup import close_response, protect_response
 from ._security import AuthenticationRecoveryBudget, RequestSecurity
+from .request_adapter import RequestAdapterLike, RequestAdapters
+from .response_adapter import ResponseAdapterLike, ResponseAdapters
 
 ResponseT = TypeVar("ResponseT")
 
@@ -71,9 +76,11 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         encoders: MediaTypeEncoders | None = None,
         decoders: MediaTypeDecoders | None = None,
         adapters: Sequence[HttpxRequestAdapter | HttpxRequestAdapterCallable] = (),
+        request_adapter: RequestAdapterLike | None = None,
+        response_adapter: ResponseAdapterLike | None = None,
         observers: Sequence[TransportObserver] = (),
         sensitive_headers: Sequence[str] = (),
-        token_manager: TokenManager | None = None,
+        token_providers: Mapping[str, TokenProvider] | None = None,
     ) -> None:
         if client is not None and base_url is not None:
             raise TransportError("base_url cannot be provided with a borrowed HTTPX client")
@@ -85,9 +92,14 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         self.adapters = tuple(adapters)
         self.observers = tuple(observers)
         self.sensitive_headers = tuple(sensitive_headers)
-        self.token_manager = token_manager
-        self._request_security: WeakKeyDictionary[httpx.Request, RequestSecurity] = WeakKeyDictionary()
+        self.token_providers = MappingProxyType(dict(token_providers or {}))
+        self._request_adapter = RequestAdapters(
+            *((self._adapt_legacy_request,) if self.adapters else ()),
+            *((request_adapter,) if request_adapter is not None else ()),
+        )
+        self._response_adapter = ResponseAdapters(*((response_adapter,) if response_adapter is not None else ()))
         self._closed = False
+        self._cleanup: asyncio.Task[None] | None = None
         self._event_sources: set[HttpxEventSource] = set()
 
     @classmethod
@@ -95,30 +107,39 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         """Use a borrowed application client for API and isolated OAuth requests.
 
         The client's base URL must match the resolved endpoint. The caller owns its lifetime.
-        For other transport options, pass ``settings.token_manager`` to the normal constructor.
+        For other transport options, pass ``settings.token_providers`` to the normal constructor.
         """
         if str(client.base_url).rstrip("/") != str(httpx.URL(settings.base_url)).rstrip("/"):
             raise ValueError("HTTPX client base URL must match resolved settings")
-        return cls(client, token_manager=settings.token_manager)
+        return cls(client, token_providers=settings.token_providers)
 
     def register_problem(self, type_uri: str, problem_type: type[Problem]) -> None:
         """Register a generated problem exception for response decoding."""
         self.problem_registry.register(type_uri, problem_type)
 
+    async def transport_request(self, spec: RequestSpec[Any]) -> httpx.Request:
+        """Materialize an optionally authorized request, handing its lifecycle to the consumer."""
+        request = await self._prepare_request(spec)
+        if spec.security is not None:
+            await RequestSecurity(spec.security).authorize(request, self.token_providers)
+        return await self._request_adapter.adapt(request)
+
     async def _prepare_request(self, spec: RequestSpec[Any]) -> httpx.Request:
-        """Build and adapt an HTTPX request from a declarative specification."""
+        """Build without adapting; execution and export each own their adaptation step."""
         if self._closed:
             raise TransportError("HttpxTransport is closed")
-        request = self._build_request(spec)
-        adapted = await self._adapt_request(request)
-        if adapted is not request and request in self._request_security:
-            self._request_security[adapted] = self._request_security[request]
-        return adapted
+        return self._build_request(spec)
+
+    async def execute_request(self, spec: RequestSpec[Any]) -> httpx.Response:
+        """Execute with invocation-local security receipts and no request-attached state."""
+        request = await self._prepare_request(spec)
+        security = RequestSecurity(spec.security) if spec.security is not None else None
+        return await self._execute(request, stream=False, security=security)
 
     def _build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
         try:
             return self._build_validated_request(spec)
-        except RequestEncodingError:
+        except (RequestEncodingError, RequestCancellationError):
             raise
         except (TypeError, ValueError) as error:
             raise RequestEncodingError(
@@ -193,17 +214,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             content = body.content()
             headers["content-type"] = str(body.content_type)
         elif isinstance(body, StreamingBody):
-            streaming_content = body.content()
-            if isinstance(streaming_content, (bytes, AsyncIterable)):
-                content = streaming_content
-            else:
-                iterable_content: Iterable[bytes] = streaming_content
-
-                async def async_content() -> AsyncIterable[bytes]:
-                    for chunk in iterable_content:
-                        yield chunk
-
-                content = async_content()
+            content = BodyStream(body)
             content_type = self._raw_content_type(headers, content_types)
             if content_type is not None and "content-type" not in headers:
                 headers["content-type"] = str(content_type)
@@ -215,6 +226,8 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             )
             try:
                 content_type, encoder = self._encoded_content_type(headers, content_types, default)
+            except RequestCancellationError:
+                raise
             except RequestEncodingError:
                 if not isinstance(body, (bytes, bytearray, memoryview)):
                     raise
@@ -223,6 +236,8 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             else:
                 try:
                     content = encoder.encode(body)
+                except RequestCancellationError:
+                    raise
                 except (TypeError, ValueError) as error:
                     raise RequestEncodingError(
                         "Request body encoding failed",
@@ -232,11 +247,11 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                 headers["content-type"] = str(content_type)
 
         request = self.client.build_request(spec.method.upper(), path, headers=headers, content=content)
-        if spec.security is not None:
-            if spec.security and "authorization" not in headers:
-                # A borrowed client's default credentials are not part of the selected alternative.
-                request.headers.pop("authorization", None)
-            self._request_security[request] = RequestSecurity(spec.security)
+        if isinstance(content, BodyStream):
+            request.stream = content
+        if spec.security and "authorization" not in headers:
+            # A borrowed client's default credentials are not part of the selected alternative.
+            request.headers.pop("authorization", None)
         return request
 
     def _header_media_type(self, headers: httpx.Headers, name: str) -> MediaType | None:
@@ -276,67 +291,107 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             details={"content_types": tuple(str(item) for item in candidates)},
         )
 
-    async def _adapt_request(self, request: httpx.Request) -> httpx.Request:
+    async def _adapt_legacy_request(self, request: httpx.Request) -> httpx.Request:
         for adapter in self.adapters:
             adapt = getattr(adapter, "adapt", None)
             adapted = await adapt(self, request) if adapt is not None else await adapter(self, request)  # type: ignore[operator]
             if adapted is not None:
-                if adapted is not request and request in self._request_security:
-                    self._request_security[adapted] = self._request_security[request]
                 request = adapted
         return request
 
-    async def _authorize_request(self, request: httpx.Request) -> RequestSecurity | None:
-        security = self._request_security.get(request)
-        if security is not None:
-            security = await security.authorize(request, self.token_manager)
-            self._request_security[request] = security
-        return security
-
     async def _send(self, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
-        """Send a native HTTPX request."""
-        return await self._send_authorized(request, stream=stream)
+        return await self._execute(request, stream=stream)
 
     async def _send_event_stream(
-        self, request: httpx.Request, *, recovery_budget: AuthenticationRecoveryBudget
+        self,
+        request: httpx.Request,
+        *,
+        recovery_budget: AuthenticationRecoveryBudget,
+        security: RequestSecurity | None = None,
     ) -> httpx.Response:
-        return await self._send_authorized(request, stream=True, follow_redirects=True, recovery_budget=recovery_budget)
+        return await self._execute(
+            request, stream=True, follow_redirects=True, recovery_budget=recovery_budget, security=security
+        )
 
-    async def _send_authorized(
+    async def _execute(
         self,
         request: httpx.Request,
         *,
         stream: bool,
         follow_redirects: bool | None = None,
         recovery_budget: AuthenticationRecoveryBudget | None = None,
+        security: RequestSecurity | None = None,
     ) -> httpx.Response:
         budget = recovery_budget or AuthenticationRecoveryBudget()
-        security = await self._authorize_request(request)
-        # This is the sole owner of authentication replay for one transport invocation.
-        response = await self._send_httpx(request, stream=stream, follow_redirects=follow_redirects)
-        rejected = security.rejected_leases(request, response) if security is not None else ()
-        if rejected and self.token_manager is not None and budget.consume():
-            with anyio.CancelScope(shield=True):
-                await response.aclose()
-            for lease in rejected:
-                await self.token_manager.invalidate(lease)
-            await self._authorize_request(request)
-            response = await self._send_httpx(request, stream=stream, follow_redirects=follow_redirects)
-        if security is not None and security.bindings:
-            response.request = security.diagnostic_request(request)
-        return response
+        follow = self.client.follow_redirects if follow_redirects is None else follow_redirects
+        prepared = request
+        redirects = 0
+        history: list[httpx.Response] = []
+        while True:
+            sent = copy_request(prepared)
+            authorized = await security.authorize(sent, self.token_providers) if security is not None else None
+            try:
+                sent = await self._request_adapter.adapt(sent)
+            except BaseException as error:
+                if authorized is not None:
+                    diagnostic_error = authorized.diagnostic_error(error, sent)
+                    if diagnostic_error is not error:
+                        raise diagnostic_error from None
+                raise
+            response = await self._send_httpx(sent, security=authorized)
+            effective = sent
+            try:
+                response.history = [*history, *response.history]
+                effective = copy_request(response.request)
+                if authorized is not None:
+                    recoverable = True
+                    for lease in authorized.rejected_leases(effective, response):
+                        recoverable = await lease.invalidate() and recoverable
+                    if not recoverable:
+                        raise TokenRejectedError()
+                response = await self._response_adapter.adapt(response, effective)
+                if budget.should_retry(effective, response):
+                    await close_response(response)
+                    continue
+                next_request = (
+                    redirect_request(prepared, effective, response)
+                    if follow and not (authorized is not None and authorized.bindings)
+                    else None
+                )
+                if next_request is not None:
+                    self.client.cookies.set_cookie_header(next_request)
+                    redirects += 1
+                    if redirects > self.client.max_redirects:
+                        raise httpx.TooManyRedirects("Exceeded maximum allowed redirects", request=effective)
+                    # HTTPX buffers intermediate redirect bodies even when the final response streams.
+                    await run_io(response.aread)
+                    await close_response(response)
+                    history = [*response.history, response]
+                    prepared = next_request
+                    continue
+                if authorized is not None and authorized.bindings:
+                    response.request = authorized.diagnostic_request(effective)
+                if not stream:
+                    await run_io(response.aread)
+                    await close_response(response)
+                return response
+            except BaseException as error:
+                await close_response(response, error)
+                if authorized is not None:
+                    diagnostic_error = authorized.diagnostic_error(error, effective)
+                    if diagnostic_error is not error:
+                        raise diagnostic_error from None
+                raise
 
     async def _send_httpx(
         self,
         request: httpx.Request,
         *,
-        stream: bool,
-        follow_redirects: bool | None = None,
+        security: RequestSecurity | None = None,
     ) -> httpx.Response:
         if self._closed:
             raise TransportError("HttpxTransport is closed")
         started = monotonic()
-        security = self._request_security.get(request)
         diagnostic = security.diagnostic_request(request) if security is not None and security.bindings else request
         self._observe(
             TransportEvent(
@@ -347,38 +402,48 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             )
         )
         try:
-            if security is not None and security.bindings:
-                # HTTPX only strips standard Authorization on cross-origin redirects. Managed API keys
-                # must not follow redirects or allow native auth to overwrite a selected alternative.
-                response = await self.client.send(request, stream=stream, follow_redirects=False, auth=None)
-            elif follow_redirects is None:
-                response = await self.client.send(request, stream=stream)
+            if (security is not None and security.bindings) or is_credentialed(request):
+                response = await run_io(
+                    lambda: self.client.send(request, stream=True, follow_redirects=False, auth=None),
+                    discard=close_response,
+                )
             else:
-                response = await self.client.send(request, stream=stream, follow_redirects=follow_redirects)
+                response = await run_io(
+                    lambda: self.client.send(request, stream=True, follow_redirects=False),
+                    discard=close_response,
+                )
         except BaseException as error:
-            if diagnostic is not request and isinstance(error, httpx.RequestError):
-                error = type(error)("HTTP request failed", request=diagnostic)
+            if security is not None:
+                error = security.diagnostic_error(error, request)
+            try:
+                self._observe(
+                    TransportEvent(
+                        TransportEventKind.FAILURE,
+                        request.method,
+                        str(diagnostic.url),
+                        (),
+                        elapsed=monotonic() - started,
+                        error=error,
+                    )
+                )
+            except BaseException:
+                error.add_note("Reporting the HTTP request failure also failed")
+            raise error from None
+        protect_response(response)
+        try:
             self._observe(
                 TransportEvent(
-                    TransportEventKind.FAILURE,
+                    TransportEventKind.RESPONSE,
                     request.method,
                     str(diagnostic.url),
-                    (),
+                    redact_headers(response.headers.multi_items(), self.sensitive_headers),
+                    status=response.status_code,
                     elapsed=monotonic() - started,
-                    error=error,
                 )
             )
-            raise error from None
-        self._observe(
-            TransportEvent(
-                TransportEventKind.RESPONSE,
-                request.method,
-                str(diagnostic.url),
-                redact_headers(response.headers.multi_items(), self.sensitive_headers),
-                status=response.status_code,
-                elapsed=monotonic() - started,
-            )
-        )
+        except BaseException as error:
+            await close_response(response, error)
+            raise
         return response
 
     async def _decode_response(
@@ -387,19 +452,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         responses: Sequence[ResponseSpec[Any]],
     ) -> OperationResponse[Any, httpx.Response]:
         """Decode a successful response or raise its typed problem."""
-        body = await response.aread()
-        try:
-            return self._decode_buffered_response(response, body, responses)
-        finally:
-            with anyio.CancelScope(shield=True):
-                await response.aclose()
-
-    def _decode_buffered_response(
-        self,
-        response: httpx.Response,
-        body: bytes,
-        responses: Sequence[ResponseSpec[Any]],
-    ) -> OperationResponse[Any, httpx.Response]:
+        body = response.content
         if not 200 <= response.status_code < 300:
             self.raise_problem(response, body)
 
@@ -432,6 +485,8 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         try:
             decoded = decoder.decode(body, content_type) if decoder is not None else body
             result = response_spec.decoder(decoded) if response_spec.decoder is not None else decoded
+        except RequestCancellationError:
+            raise
         except (TypeError, ValueError) as error:
             raise ResponseDecodingError(
                 "Response body decoding failed",
@@ -459,6 +514,8 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                 continue
             try:
                 converted = tuple(header.decoder(value) if header.decoder is not None else value for value in values)
+            except RequestCancellationError:
+                raise
             except (TypeError, ValueError) as error:
                 raise self._unexpected(response, body, f"Invalid response header {header.name}: {error}") from error
             decoded[header.name] = converted if header.repeated else converted[0]
@@ -507,7 +564,11 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         async def request_factory(headers: tuple[tuple[str, str], ...]) -> httpx.Request:
             return self._build_request(spec.with_headers(*headers))
 
-        return self.event_source_from(request_factory, options=options)
+        from ._sse import HttpxEventSource
+
+        source = HttpxEventSource(self, request_factory, options=options, spec=spec)
+        self._event_sources.add(source)
+        return source
 
     def event_source_from(
         self,
@@ -542,13 +603,24 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             observer.observe(event)
 
     async def aclose(self) -> None:
-        """Close owned event sources and the internal HTTPX client exactly once."""
-        if self._closed:
+        """Close owned event sources and the internal HTTPX client exactly once.
+
+        Calls from an owned EventSource's adapter, native hook, or response-cleanup
+        callback request shutdown without joining their own run. External callers
+        await completion.
+        """
+        if self._cleanup is None:
+            self._closed = True
+            sources = tuple(self._event_sources)
+            for source in sources:
+                source.close()
+            self._cleanup = asyncio.create_task(self._close())
+        if any(source._owns_current_work() for source in self._event_sources):
             return
-        self._closed = True
+        await complete(self._cleanup)
+
+    async def _close(self) -> None:
         sources = tuple(self._event_sources)
-        for source in sources:
-            source.close()
         for source in sources:
             await source._wait_closed()
         if self._owns_client:
@@ -567,8 +639,13 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         traceback: TracebackType | None,
     ) -> None:
         """Close transport-owned resources when leaving a lifecycle scope."""
-        del exc_type, exc_value, traceback
-        await self.aclose()
+        del exc_type, traceback
+        try:
+            await self.aclose()
+        except BaseException:
+            if exc_value is None:
+                raise
+            exc_value.add_note("Closing the HTTP transport also failed")
 
 
 from ._sse import HttpxEventSource as HttpxEventSource  # noqa: E402

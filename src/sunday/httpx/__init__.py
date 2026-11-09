@@ -10,6 +10,7 @@ Install ``sunday-python[httpx]`` before importing this module.
 
 try:
     from ._oauth import AuthorizationGrant, HttpxOAuthTokenProvider
+    from ._requests import copy_request
     from ._transport import (
         HttpxEventSource,
         HttpxEventSourceRequestFactory,
@@ -18,6 +19,8 @@ try:
         HttpxRequestAdapterCallable,
         HttpxTransport,
     )
+    from .request_adapter import RequestAdapter, RequestAdapters
+    from .response_adapter import ResponseAdapter, ResponseAdapters
 except ModuleNotFoundError as error:
     if error.name not in {"anyio", "httpx"}:
         raise
@@ -32,4 +35,9 @@ __all__ = [
     "HttpxRequestAdapter",
     "HttpxRequestAdapterCallable",
     "HttpxTransport",
+    "RequestAdapter",
+    "RequestAdapters",
+    "ResponseAdapter",
+    "ResponseAdapters",
+    "copy_request",
 ]

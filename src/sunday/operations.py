@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from .headers import ResponseHeaders
 from .media import MediaType
 from .problems import Problem
+from .request_cancellation_error import RequestCancellationError
 from .specs import NullifySpec, OperationSpec
 
 if TYPE_CHECKING:
@@ -68,7 +69,7 @@ class Operation[ResponseT, TransportRequestT, TransportResponseT]:
 
     async def transport_response(self) -> TransportResponseT:
         """Send a fresh native request and return its native response."""
-        return await self.transport.transport_response(await self.transport_request())
+        return await self.transport.execute_request(self.spec.request)
 
 
 class StreamingOperation[ResponseT, TransportRequestT, TransportResponseT](
@@ -105,6 +106,8 @@ class NullableOperation[ResponseT, TransportRequestT, TransportResponseT]:
         """Return ``None`` when a configured problem is raised."""
         try:
             return await self.response()
+        except RequestCancellationError:
+            raise
         except Problem as problem:
             if self._matches(problem):
                 return None

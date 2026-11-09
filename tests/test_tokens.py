@@ -4,11 +4,14 @@
 # you may not use this file except in compliance with the License.
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import Literal, cast
 
 import pytest
 
+from sunday.request_cancellation_error import RequestCancellationError
 from sunday.security import SecurityBinding, SecurityEndpoints, SecurityTransport
 from sunday.token_manager import TokenManager
 from sunday.token_provider import (
@@ -17,6 +20,7 @@ from sunday.token_provider import (
     TokenProviderError,
     TokenRequest,
     TokenSet,
+    provider_credentials,
 )
 
 BINDING = SecurityBinding(
@@ -340,3 +344,165 @@ async def test_interactive_attempt_history_is_bounded_without_reusing_failed_gra
     with pytest.raises(TokenProviderError):
         await fresh.credentials(binding)
     assert len(provider.acquisitions) == 1025
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("managed", [False, True])
+async def test_provider_request_resolution_preserves_configuration(managed: bool) -> None:
+    provider = Provider()
+    provider.tokens = TokenSet("token")
+    provider.configuration = TokenConfiguration(
+        "client", "session", SecurityEndpoints(token_url="https://override.example/token")
+    )
+    binding = replace(BINDING, scopes=("write", "read", "read"), refresh_url="https://identity.example/refresh")
+    source = TokenManager(provider) if managed else provider
+    await provider_credentials(source, binding)
+    assert provider.acquisitions == [
+        TokenRequest(
+            scheme=binding.scheme,
+            provider=binding.provider,
+            profile=binding.profile,
+            flow=binding.flow,
+            transport=binding.transport,
+            token_url="https://override.example/token",
+            refresh_url="https://identity.example/refresh",
+            scopes=("read", "write"),
+            client_identity="client",
+            grant_identity="session",
+        )
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("managed", [False, True])
+async def test_provider_configuration_stop_preserves_identity(managed: bool) -> None:
+    stop = RequestCancellationError("stop configuring credentials")
+
+    class StoppingProvider(Provider):
+        def configure(self, binding: SecurityBinding) -> TokenConfiguration:
+            raise stop
+
+    provider = StoppingProvider()
+    source = TokenManager(provider) if managed else provider
+    with pytest.raises(RequestCancellationError) as failure:
+        await provider_credentials(source, BINDING)
+    assert failure.value is stop
+    assert provider.acquisitions == []
+
+
+@pytest.mark.anyio
+async def test_external_provider_does_not_require_managed_grant_identity() -> None:
+    provider = Provider()
+    provider.tokens = TokenSet("token")
+    provider.configuration = TokenConfiguration("client")
+    binding = replace(BINDING, flow="authorizationCode")
+    assert (await provider_credentials(provider, binding)).tokens.access_token == "token"
+    with pytest.raises(TokenProviderError):
+        await provider_credentials(TokenManager(provider), binding)
+    assert len(provider.acquisitions) == 1
+
+
+@pytest.mark.anyio
+async def test_abandoned_persistence_failure_is_retrieved_without_duplicate_loop_reporting() -> None:
+    saving, finish = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    reported: list[object] = []
+
+    class Store:
+        async def load(self, _key: str) -> TokenSet | None:
+            return None
+
+        async def save(self, _key: str, _tokens: TokenSet) -> None:
+            saving.set()
+            await finish.wait()
+            raise RuntimeError("persistence failed after caller cancellation")
+
+        async def remove(self, _key: str) -> None:
+            pass
+
+    manager = TokenManager(Provider(), store=Store(), now=lambda: 0)
+    loop.set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
+    try:
+        waiter = asyncio.create_task(manager.credentials(BINDING))
+        await saving.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        finish.set()
+        while manager._renewals:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert reported == []
+    finally:
+        finish.set()
+        loop.set_exception_handler(previous)
+
+
+@contextmanager
+def _task_factory(eager: bool) -> Iterator[None]:
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    loop.set_task_factory(asyncio.eager_task_factory if eager else None)
+    try:
+        yield
+    finally:
+        loop.set_task_factory(previous)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("eager", [False, True], ids=["deferred", "eager"])
+@pytest.mark.parametrize("refresh", [False, True], ids=["acquire", "refresh"])
+async def test_immediate_renewal_is_registered_before_persistence(eager: bool, refresh: bool) -> None:
+    provider = Provider()
+    now = 0.0
+    manager = TokenManager(provider, now=lambda: now)
+    if refresh:
+        await manager.credentials(BINDING)
+        now = 71
+        provider.tokens = TokenSet("second", 200, "refresh-second")
+    with _task_factory(eager):
+        first, second = await asyncio.gather(manager.credentials(BINDING), manager.credentials(BINDING))
+        assert first.tokens == second.tokens == provider.tokens
+        assert (await manager.credentials(BINDING)).tokens == provider.tokens
+    assert len(provider.acquisitions) == 1
+    assert provider.refreshes == (["refresh-first"] if refresh else [])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("eager", [False, True], ids=["deferred", "eager"])
+@pytest.mark.parametrize("refresh", [False, True], ids=["acquire", "refresh"])
+@pytest.mark.parametrize("native", [False, True], ids=["stop", "cancelled"])
+async def test_immediate_renewal_cancellation_preserves_identity(eager: bool, refresh: bool, native: bool) -> None:
+    error = asyncio.CancelledError("cancel renewal") if native else RequestCancellationError("stop renewal")
+
+    class StoppingProvider(Provider):
+        failure: BaseException | None = None
+
+        async def acquire(self, request: TokenRequest) -> TokenSet:
+            if self.failure is not None:
+                raise self.failure
+            return await super().acquire(request)
+
+        async def refresh(self, request: TokenRequest, refresh_token: str) -> TokenSet:
+            if self.failure is not None:
+                raise self.failure
+            return await super().refresh(request, refresh_token)
+
+    provider = StoppingProvider()
+    now = 0.0
+    manager = TokenManager(provider, now=lambda: now)
+    if refresh:
+        await manager.credentials(BINDING)
+        now = 71
+    provider.failure = error
+    with _task_factory(eager):
+        with pytest.raises(type(error)) as failure:
+            await manager.credentials(BINDING)
+        assert failure.value is error
+        # A failed renewal must not poison the next acquisition or refresh.
+        provider.failure = None
+        provider.tokens = TokenSet("recovered", 200)
+        assert (await manager.credentials(BINDING)).tokens.access_token == "recovered"
+    assert len(provider.acquisitions) == 1
+    assert provider.refreshes == (["refresh-first"] if refresh else [])

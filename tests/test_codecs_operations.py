@@ -315,6 +315,32 @@ async def test_operation_builds_fresh_requests_and_returns_metadata() -> None:
 
 
 @pytest.mark.anyio
+async def test_operation_execution_preserves_send_overrides_without_exporting() -> None:
+    class ExportingTransport(FakeTransport):
+        exports = 0
+        sends = 0
+
+        async def transport_request(self, spec: RequestSpec[Any]) -> tuple[int, RequestSpec[Any]]:
+            self.exports += 1
+            return await super().transport_request(spec)
+
+        async def transport_response(
+            self, request: tuple[int, RequestSpec[Any]]
+        ) -> tuple[tuple[int, RequestSpec[Any]], bool]:
+            self.sends += 1
+            return await super().transport_response(request)
+
+    transport = ExportingTransport()
+    spec: OperationSpec[None, str] = OperationSpec(RequestSpec("GET", "/projects"), (ResponseSpec(200),))
+    operation = Operation(transport, spec)
+    await operation.transport_response()
+    await operation.execute()
+    assert (transport.exports, transport.sends) == (0, 2)
+    await operation.transport_request()
+    assert (transport.exports, transport.sends) == (1, 2)
+
+
+@pytest.mark.anyio
 async def test_streaming_body_creates_fresh_sync_and_async_content() -> None:
     sync_body = StreamingBody.iterable(lambda: [b"one", bytearray(b"two")])
 
@@ -467,3 +493,17 @@ async def _bodyless_parameter_check() -> None:
         with pytest.raises(RequestEncodingError):
             await transport.transport_request(spec)
         assert validations == 2
+
+
+@pytest.mark.anyio
+async def test_base_transport_decoding_uses_managed_execution_override() -> None:
+    class ManagedTransport(FakeTransport):
+        async def execute_request(self, spec: RequestSpec[Any]) -> tuple[tuple[int, RequestSpec[Any]], bool]:
+            self.calls.append("managed")
+            return await super().execute_request(spec)
+
+    transport = ManagedTransport()
+    spec = OperationSpec[None, str](RequestSpec("GET", "/value"), (ResponseSpec(200),))
+    response = await transport.response(spec)
+    assert response.result == "result"
+    assert transport.calls == ["managed", "transport_request", "transport_response", "response"]

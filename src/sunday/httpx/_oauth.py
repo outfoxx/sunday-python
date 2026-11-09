@@ -20,10 +20,13 @@ from authlib.oauth2.auth import ClientAuth  # type: ignore[import-untyped]
 from authlib.oauth2.rfc6749.parameters import prepare_token_request  # type: ignore[import-untyped]
 
 from ..credentials import AuthorizationGrant as AuthorizationGrant
+from ..request_cancellation_error import RequestCancellationError
 from ..security import SecurityBinding, SecurityEndpoints
 from ..token_provider import AuthorizationRequiredError, TokenConfiguration, TokenProviderError, TokenRequest, TokenSet
+from ._async import run_io
 from ._oauth_wire import DiscoveryMetadata, TokenErrorResponse, TokenSuccessResponse
 from ._oauth_wire import endpoint as _endpoint
+from ._response_cleanup import close_response
 
 
 class HttpxOAuthTokenProvider:
@@ -103,7 +106,7 @@ class HttpxOAuthTokenProvider:
             else:
                 raise TokenProviderError()
             return await self._exchange(request, request.token_url, form)
-        except (AuthorizationRequiredError, TokenProviderError):
+        except (RequestCancellationError, TokenProviderError):
             raise
         except httpx.TransportError:
             raise TokenProviderError("temporary") from None
@@ -119,7 +122,7 @@ class HttpxOAuthTokenProvider:
                 request.refresh_url or request.token_url,
                 {"grant_type": "refresh_token", "refresh_token": refresh_token},
             )
-        except (AuthorizationRequiredError, TokenProviderError):
+        except (RequestCancellationError, TokenProviderError):
             raise
         except httpx.TransportError:
             raise TokenProviderError("temporary") from None
@@ -131,10 +134,13 @@ class HttpxOAuthTokenProvider:
             return request
         if not self._issuer:
             raise TokenProviderError()
-        response = await self._client.send(
-            httpx.Request("GET", _endpoint(request.discovery_url), headers={"Accept": "application/json"}),
-            auth=None,
-            follow_redirects=False,
+        response = await run_io(
+            lambda: self._client.send(
+                httpx.Request("GET", _endpoint(request.discovery_url), headers={"Accept": "application/json"}),
+                auth=None,
+                follow_redirects=False,
+            ),
+            discard=close_response,
         )
         _check_availability(response.status_code)
         if response.status_code != 200:
@@ -177,10 +183,13 @@ class HttpxOAuthTokenProvider:
             {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
             body,
         )
-        response = await self._client.send(
-            httpx.Request("POST", url, content=body, headers=headers),
-            auth=None,
-            follow_redirects=False,
+        response = await run_io(
+            lambda: self._client.send(
+                httpx.Request("POST", url, content=body, headers=headers),
+                auth=None,
+                follow_redirects=False,
+            ),
+            discard=close_response,
         )
         _check_availability(response.status_code)
         if response.status_code != 200:
