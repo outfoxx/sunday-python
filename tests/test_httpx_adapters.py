@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 import anyio
@@ -800,3 +801,64 @@ async def test_redirect_history_collection_preserves_stop_identity(streaming: bo
             await perform(HttpxTransport(client), streaming)
         assert failure.value is stop
     assert sends == body.reads == body.closes == 1
+
+
+@pytest.mark.parametrize(("stage", "streaming"), [("adapter", False), ("adapter", True), ("collection", False)])
+@pytest.mark.parametrize("bound_error", [False, True])
+@pytest.mark.parametrize("stop", [False, True])
+@pytest.mark.parametrize("managed", [True, False])
+async def test_managed_read_errors_sanitize_diagnostics_without_rewriting_stop_errors(
+    stage: str, streaming: bool, bound_error: bool, stop: bool, managed: bool
+) -> None:
+    provider = Provider()
+    bindings = (
+        BINDING,
+        replace(BINDING, scheme="query", transport=SecurityTransport(location="query", name="api_key")),
+        replace(BINDING, scheme="cookie", transport=SecurityTransport(location="cookie", name="session")),
+    )
+    sent: list[httpx.Request] = []
+    errors: list[httpx.ReadError] = []
+    bodies: list[Body] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        error = (Stop if stop else httpx.ReadError)(
+            f"Read failed for {request.url}: {request.headers}", request=request if bound_error else None
+        )
+        errors.append(error)
+        body = Body(error=error)
+        bodies.append(body)
+        return httpx.Response(200, stream=body)
+
+    async def adapt(response: httpx.Response, request: httpx.Request) -> httpx.Response:
+        # Adapters need the effective credentials; only escaping diagnostics change.
+        if managed:
+            assert request.headers["authorization"] == "Bearer token-1"
+            assert request.url.params["api_key"] == "token-2"
+            assert request.headers["cookie"] == "session=token-3"
+        if stage == "adapter":
+            await response.aread()
+        return response
+
+    async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
+        transport = HttpxTransport(client, response_adapter=adapt, token_providers={"identity": provider})
+        with pytest.raises(httpx.ReadError) as failure:
+            await perform(transport, streaming, RequestSpec("GET", "/value", security=bindings if managed else None))
+    error = failure.value
+    assert len(sent) == 1
+    assert bodies[0].closes == 1
+    if managed and not stop:
+        assert type(error) is httpx.ReadError
+        assert error is not errors[0]
+        assert str(error) == "HTTP request failed"
+        assert error.request.headers["authorization"] == "[redacted]"
+        assert error.request.url.params["api_key"] == "[redacted]"
+        assert error.request.headers["cookie"] == "[redacted]"
+        assert "token-" not in str(error.request.url)
+        assert "token-" not in str(error.request.headers)
+        assert error.__cause__ is None and error.__suppress_context__
+        assert sent[0].headers["authorization"] == "Bearer token-1"
+        assert sent[0].url.params["api_key"] == "token-2"
+        assert sent[0].headers["cookie"] == "session=token-3"
+    else:
+        assert error is errors[0]

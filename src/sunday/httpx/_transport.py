@@ -332,6 +332,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             authorized = await security.authorize(sent, self.token_providers) if security is not None else None
             sent = await self._request_adapter.adapt(sent)
             response = await self._send_httpx(sent, security=authorized)
+            effective = sent
             try:
                 response.history = [*history, *response.history]
                 effective = copy_request(response.request)
@@ -369,6 +370,13 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                 return response
             except BaseException as error:
                 await close_response(response, error)
+                if (
+                    authorized is not None
+                    and authorized.bindings
+                    and isinstance(error, httpx.RequestError)
+                    and not isinstance(error, RequestCancellationError)
+                ):
+                    raise type(error)("HTTP request failed", request=authorized.diagnostic_request(effective)) from None
                 raise
 
     async def _send_httpx(
