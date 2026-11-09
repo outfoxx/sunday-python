@@ -39,19 +39,25 @@ def copy_request(
     else:
         with suppress(httpx.RequestNotRead):
             content = request.content
+        if "content-length" not in copied_headers and "transfer-encoding" not in copied_headers:
+            for name in ("content-length", "transfer-encoding"):
+                if name in request.headers:
+                    copied_headers[name] = request.headers[name]
     if content is not None:
-        return httpx.Request(
+        copied = httpx.Request(
             method or request.method,
             target_url,
             headers=copied_headers,
             content=content,
             extensions=dict(request.extensions),
         )
+        # HTTPX adds Content-Length for cached bytes even when Transfer-Encoding
+        # already supplies framing. A copy must not introduce both headers.
+        if "transfer-encoding" in copied.headers:
+            copied.headers.pop("content-length", None)
+        return copied
     if "content-length" not in copied_headers and "transfer-encoding" not in copied_headers:
-        if "content-length" in request.headers:
-            copied_headers["content-length"] = request.headers["content-length"]
-        else:
-            copied_headers["transfer-encoding"] = request.headers.get("transfer-encoding", "chunked")
+        copied_headers["transfer-encoding"] = "chunked"
     return httpx.Request(
         method or request.method,
         target_url,

@@ -597,8 +597,9 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
     async def aclose(self) -> None:
         """Close owned event sources and the internal HTTPX client exactly once.
 
-        Calls from an owned EventSource's active adapter or native hook request
-        shutdown without joining their own run. External callers await completion.
+        Calls from an owned EventSource's adapter, native hook, or response-cleanup
+        callback request shutdown without joining their own run. External callers
+        await completion.
         """
         if self._cleanup is None:
             self._closed = True
@@ -606,7 +607,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             for source in sources:
                 source.close()
             self._cleanup = asyncio.create_task(self._close())
-        if any(source._owns_current_io() for source in self._event_sources):
+        if any(source._owns_current_work() for source in self._event_sources):
             return
         await complete(self._cleanup)
 

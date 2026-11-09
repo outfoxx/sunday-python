@@ -343,7 +343,7 @@ class HttpxEventSource:
         self._spec = spec or RequestSpec("GET", "/")
         self._ready_state = EventSourceState.CLOSED
         self._stream: HttpxEventStream[ServerSentEvent] | None = None
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._tasks: dict[asyncio.Task[None], HttpxEventStream[ServerSentEvent]] = {}
         self._listeners: dict[str, dict[UUID, EventSourceMessageHandler]] = {}
         self.on_open: EventSourceOpenHandler | None = None
         self.on_error: EventSourceErrorHandler | None = None
@@ -395,7 +395,7 @@ class HttpxEventSource:
         )
         self._stream = stream
         task = loop.create_task(self._run(stream), name="sunday-httpx-event-source")
-        self._tasks.add(task)
+        self._tasks[task] = stream
         task.add_done_callback(self._finished)
 
     def close(self) -> None:
@@ -406,10 +406,12 @@ class HttpxEventSource:
         if not self._tasks:
             self._transport._event_source_closed(self)
 
-    def _owns_current_io(self) -> bool:
-        # Native hook child tasks inherit the initiating run's I/O record. Include
-        # retiring runs, whose streams may no longer be self._stream.
-        return any(owner.task in self._tasks and not owner.done.is_set() for owner in _io_owners.get())
+    def _owns_current_work(self) -> bool:
+        # Cleanup can outlive the I/O block. Retain each run's stream so callbacks
+        # from retiring runs are recognized as well as the current run's callbacks.
+        return any(owner.task in self._tasks and not owner.done.is_set() for owner in _io_owners.get()) or any(
+            stream._response is not None and in_response_cleanup(stream._response) for stream in self._tasks.values()
+        )
 
     async def _wait_closed(self) -> None:
         if self._tasks:
@@ -433,7 +435,7 @@ class HttpxEventSource:
 
     def _finished(self, task: asyncio.Task[None]) -> None:
         # Retiring runs still own resources even after a replacement has connected.
-        self._tasks.discard(task)
+        self._tasks.pop(task, None)
         if not self._tasks:
             self._transport._event_source_closed(self)
 

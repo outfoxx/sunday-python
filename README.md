@@ -382,8 +382,9 @@ HTTPX responses and headers are mutable; `await response.aread()` retains buffer
 subsequent readers. Return a new `httpx.Response` to replace the body. `copy_request()` preserves
 native extensions and shares an unread stream without consuming it; pass `content=b""` to remove
 a body. Changing the URL authority updates `Host` unless the supplied `headers` explicitly
-override it. Replacing headers preserves an unread body's framing unless `Content-Length` or
-`Transfer-Encoding` is explicitly supplied; streams without known framing use chunked encoding.
+override it. Replacing headers preserves an unchanged body's framing unless `Content-Length` or
+`Transfer-Encoding` is explicitly supplied. Buffering a chunked upload before copying it retains
+chunked framing without adding `Content-Length`; streams without known framing use chunked encoding.
 Use asynchronous streams; synchronous factories must not block the event loop.
 
 Subclass `sunday.RequestCancellationError` to veto retries and SSE reconnects. Sunday propagates
@@ -398,9 +399,9 @@ boundary that allows HTTPX/httpcore to finish internal cleanup before the origin
 is rethrown. This also covers OAuth discovery and token exchanges. Transport shutdown shares
 one completion task across callers and waits for retiring EventSource runs before closing an
 owned client. A cancelled shutdown waiter does not cancel that shared cleanup. When an owned
-EventSource's adapter or native hook calls `transport.aclose()`, it requests shutdown without
-joining its own run; external callers still wait for cleanup to finish. This also applies to
-retiring runs after an immediate reconnect.
+EventSource's adapter, native hook, or response-cleanup callback calls `transport.aclose()`, it
+requests shutdown without joining its own run; external callers still wait for cleanup to finish.
+This also applies to retiring runs after an immediate reconnect.
 Buffered collection uses HTTPX's bulk `aread()` with one owner task for the entire body; SSE uses
 its asynchronous byte iterator with cancellation bounded to each read.
 Use `async with stream` or explicitly await `stream.aclose()` when ending iteration early.

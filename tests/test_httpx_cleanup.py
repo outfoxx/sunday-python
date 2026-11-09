@@ -120,8 +120,9 @@ async def execute(transport: HttpxTransport, streaming: bool, spec: RequestSpec[
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("original", ["length", "chunked", "missing"])
 @pytest.mark.parametrize("override", [None, "length", "chunked"])
+@pytest.mark.parametrize("buffered", [False, True])
 async def test_copy_preserves_valid_streaming_framing_over_tcp(
-    server: Server, streaming: bool, original: str, override: str | None
+    server: Server, streaming: bool, original: str, override: str | None, buffered: bool
 ) -> None:
     async def adapt(request: httpx.Request) -> httpx.Request:
         if original == "missing":
@@ -131,8 +132,13 @@ async def test_copy_preserves_valid_streaming_framing_over_tcp(
             headers["Content-Length"] = "7"
         elif override == "chunked":
             headers["Transfer-Encoding"] = "chunked"
+        if buffered:
+            await request.aread()
         copied = copy_request(request, headers=headers)
-        assert copied.stream is request.stream
+        if buffered:
+            assert copied.content == request.content
+        else:
+            assert copied.stream is request.stream
         return copied
 
     async with httpx.AsyncClient(base_url=server.url, trust_env=False) as client:
@@ -147,7 +153,7 @@ async def test_copy_preserves_valid_streaming_framing_over_tcp(
         assert response.status_code == 204
     assert len(server.uploads) == 1
     headers, body = server.uploads[0]
-    expected = override or ("length" if original == "length" else "chunked")
+    expected = override or ("length" if original == "length" or (buffered and original == "missing") else "chunked")
     assert body == b"payload"
     assert headers["x-custom"] == "value"
     if expected == "length":
@@ -1549,3 +1555,163 @@ async def test_eof_cleanup_can_reenter_response_close(server: Server, streaming:
             assert closes == 1
             await server.disconnected.wait()
             assert (await client.get("/after")).status_code == 204
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("replacement", [None, b"", b"replacement"])
+async def test_buffered_chunked_upload_copy_and_replacement_framing(
+    server: Server, streaming: bool, replacement: bytes | None
+) -> None:
+    async def adapt(request: httpx.Request) -> httpx.Request:
+        assert await request.aread() == b"payload"
+        assert request.headers["transfer-encoding"] == "chunked"
+        assert "content-length" not in request.headers
+        return copy_request(request, content=replacement)
+
+    async with httpx.AsyncClient(base_url=server.url, trust_env=False) as client:
+        response = await execute(
+            HttpxTransport(client, request_adapter=adapt),
+            streaming,
+            RequestSpec("POST", "/upload", body=StreamingBody.bytes(b"payload")),
+        )
+        assert response.status_code == 204
+    (upload,) = server.uploads
+    headers, body = upload
+    assert body == (b"payload" if replacement is None else replacement)
+    if replacement is None:
+        assert headers["transfer-encoding"] == "chunked"
+        assert "content-length" not in headers
+    else:
+        assert headers["content-length"] == str(len(replacement))
+        assert "transfer-encoding" not in headers
+
+
+@pytest.mark.parametrize("callback", ["trace", "stream", "stream-stop"])
+@pytest.mark.parametrize("child_callback", [False, True])
+@pytest.mark.parametrize("retiring", [False, True])
+@pytest.mark.parametrize("owned", [False, True])
+async def test_transport_shutdown_recognizes_response_cleanup_callbacks(
+    server: Server, callback: str, child_callback: bool, retiring: bool, owned: bool
+) -> None:
+    entered, proceed, returned, release, replacement_opened = (anyio.Event() for _ in range(5))
+    errors: list[BaseException | None] = []
+    cancellations: list[asyncio.CancelledError] = []
+    original = Stop("original response cleanup stop")
+    attempts = 0
+    closes = 0
+
+    async def shutdown_from_cleanup() -> None:
+        nonlocal closes
+        closes += 1
+        entered.set()
+        await proceed.wait()
+        if child_callback:
+            await asyncio.create_task(transport.aclose())
+        else:
+            await transport.aclose()
+        returned.set()
+        await release.wait()
+
+    async def trace(name: str, info: dict[str, Any]) -> None:
+        if name == "http11.response_closed.started":
+            await shutdown_from_cleanup()
+
+    async def adapt_request(request: httpx.Request) -> httpx.Request:
+        if callback == "trace" and request.url.path == "/events":
+            request.extensions["trace"] = trace
+        return request
+
+    class ReentrantClose(httpx.AsyncByteStream):
+        def __init__(self, wrapped: httpx.AsyncByteStream) -> None:
+            self.wrapped = wrapped
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self.wrapped.__aiter__()
+
+        async def aclose(self) -> None:
+            await shutdown_from_cleanup()
+            await self.wrapped.aclose()
+            if callback == "stream-stop":
+                raise original
+
+    async def adapt_response(response: httpx.Response, request: httpx.Request) -> httpx.Response:
+        if callback != "trace" and request.url.path == "/events":
+            assert isinstance(response.stream, httpx.AsyncByteStream)
+            response.stream = ReentrantClose(response.stream)
+        return response
+
+    async def close_externally() -> None:
+        try:
+            await transport.aclose()
+        except asyncio.CancelledError as error:
+            cancellations.append(error)
+            raise
+
+    async with httpx.AsyncClient(
+        base_url=server.url, trust_env=False, limits=httpx.Limits(max_connections=2 if retiring else 1), timeout=1
+    ) as client:
+        transport = HttpxTransport(
+            None if owned else client,
+            base_url=server.url if owned else None,
+            request_adapter=adapt_request,
+            response_adapter=adapt_response,
+        )
+
+        def factory(headers: tuple[tuple[str, str], ...]) -> httpx.Request:
+            nonlocal attempts
+            attempts += 1
+            return transport.client.build_request(
+                "GET", "/events" if attempts == 1 else "/replacement", headers=headers
+            )
+
+        def message(event: Any) -> None:
+            if attempts == 1:
+                # Exit at a yielded event: cleanup runs outside the I/O ownership scope.
+                source.close()
+                if retiring:
+                    source.connect()
+            else:
+                replacement_opened.set()
+
+        source = transport.event_source_from(factory)
+        source.on_message = message
+        source.on_error = errors.append
+        source.connect()
+        closers: list[asyncio.Task[None]] = []
+        try:
+            with anyio.fail_after(3):
+                await entered.wait()
+                if retiring:
+                    await replacement_opened.wait()
+                closers = [asyncio.create_task(close_externally()), asyncio.create_task(transport.aclose())]
+                await anyio.sleep(0)
+                proceed.set()
+                await returned.wait()
+                closers[0].cancel("original external shutdown cancellation")
+                await anyio.sleep(0)
+                closers[0].cancel("later external shutdown cancellation")
+                await anyio.sleep(0)
+                assert all(not task.done() for task in closers)
+                assert not transport.client.is_closed
+                release.set()
+                with pytest.raises(asyncio.CancelledError) as failure:
+                    await closers[0]
+                assert failure.value is cancellations[0]
+                assert failure.value.args == ("original external shutdown cancellation",)
+                await closers[1]
+                assert not source._tasks
+                assert closes == 1
+                assert attempts == (2 if retiring else 1)
+                if callback == "stream-stop" and not retiring:
+                    assert len(errors) == 1 and errors[0] is original
+                else:
+                    assert errors == []
+                await server.disconnected.wait()
+                assert transport.client.is_closed is owned
+                if not owned:
+                    assert (await client.get("/after")).status_code == 204
+        finally:
+            proceed.set()
+            release.set()
+            await asyncio.gather(*closers, return_exceptions=True)
+            await transport.aclose()
