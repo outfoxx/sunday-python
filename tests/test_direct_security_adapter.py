@@ -1,3 +1,5 @@
+from typing import Any
+
 import httpx
 import pytest
 
@@ -14,23 +16,23 @@ BINDING = SecurityBinding(
 )
 
 
-async def test_direct_adapters_receive_bindings_without_token_providers():
+async def test_direct_adapters_receive_bindings_without_token_providers() -> None:
     calls = []
 
-    async def adapt(request):
+    async def adapt(request: httpx.Request) -> httpx.Request:
         assert request_security_bindings(request) == (BINDING,)
         return httpx.Request(request.method, request.url, headers={"Authorization": "Bearer custom"})
 
-    async def copy(request):
+    async def copy(request: httpx.Request) -> httpx.Request:
         assert request_security_bindings(request) == (BINDING,)
         return copy_request(request)
 
-    async def response_adapter(response, request):
+    async def response_adapter(response: httpx.Response, request: httpx.Request) -> httpx.Response:
         assert request_security_bindings(request) == (BINDING,)
         assert request.headers["Authorization"] == "Bearer custom"
         return response
 
-    async def send(request):
+    async def send(request: httpx.Request) -> httpx.Response:
         calls.append(request)
         return httpx.Response(401, headers={"WWW-Authenticate": 'Bearer error="invalid_token"'}, content=b"original")
 
@@ -38,7 +40,7 @@ async def test_direct_adapters_receive_bindings_without_token_providers():
         transport = HttpxTransport(
             client=client, request_adapter=RequestAdapters(adapt, copy), response_adapter=response_adapter
         )
-        spec = RequestSpec("GET", "/value", security=(BINDING,))
+        spec: RequestSpec[Any] = RequestSpec("GET", "/value", security=(BINDING,))
         exported = await transport.transport_request(spec)
         assert exported.headers["Authorization"] == "Bearer custom"
         response = await transport.execute_request(spec)
@@ -47,13 +49,13 @@ async def test_direct_adapters_receive_bindings_without_token_providers():
         assert len(calls) == 1
 
 
-async def test_direct_adapter_cancellation_prevents_sending():
+async def test_direct_adapter_cancellation_prevents_sending() -> None:
     stop = RequestCancellationError("application authorization unavailable")
 
-    async def adapt(request):
+    async def adapt(request: httpx.Request) -> httpx.Request:
         raise stop
 
-    async def send(request):
+    async def send(request: httpx.Request) -> httpx.Response:
         pytest.fail("Cancelled request was sent")
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(send)) as client:

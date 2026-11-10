@@ -47,8 +47,11 @@ class RequestAdapters(RequestAdapter):
         """Run each adapter once, preserving native task cancellation."""
         for adapter in self.adapters:
             await anyio.lowlevel.checkpoint_if_cancelled()
+            metadata = {key: value for key, value in request.extensions.items() if key.startswith("sunday.")}
             bindings = request_security_bindings(request)
             request = await adapter.adapt(request) if isinstance(adapter, RequestAdapter) else await adapter(request)
+            for key, value in metadata.items():
+                request.extensions.setdefault(key, value)
             _set_request_security_bindings(request, bindings)
         await anyio.lowlevel.checkpoint_if_cancelled()
         return request

@@ -101,13 +101,13 @@ authoritative.
 ## Profiled credentials
 
 Generated operations carry selected `SecurityBinding` metadata in `RequestSpec.security`. Applications
-pass named providers directly to `HttpxTransport(token_providers=...)`.
+compose providers explicitly with `HttpxTransport(..., **authentication_adapters(providers))`.
 Providers and token storage stay in the application; generated code contains no credentials.
 
 ```python
 import httpx
 from sunday import TokenManager
-from sunday.httpx import HttpxOAuthTokenProvider, HttpxTransport
+from sunday.httpx import HttpxOAuthTokenProvider, HttpxTransport, authentication_adapters
 
 
 def create_transport(client: httpx.AsyncClient, client_secret: str) -> HttpxTransport:
@@ -121,7 +121,7 @@ def create_transport(client: httpx.AsyncClient, client_secret: str) -> HttpxTran
     )
     return HttpxTransport(
         client,
-        token_providers={"service-identity": TokenManager(provider)},
+        **authentication_adapters({"service-identity": TokenManager(provider)}),
     )
 ```
 
@@ -290,8 +290,9 @@ field configuration above. A literal string `"UNSET"` remains an ordinary string
 
 ## Application-owned token lifecycle
 
-Transports accept named `TokenProvider` instances directly. Settings preserve supplied providers and
-never add a token cache. Every managed network attempt asks its provider for current credentials.
+Transports accept only request and response adapters; they have no token-provider option or authentication retry logic.
+The optional `AuthenticationAdapter` bridges named providers to these contracts. Settings factories compose it explicitly
+without adding a cache. External authentication frameworks can implement the adapters directly.
 An external framework (for example Auth0) remains responsible for storage, renewal and logout.
 Return only its access token and optional expiry; keep its refresh token inside that framework.
 
@@ -303,7 +304,8 @@ settings = ClientSettings.resolve(
     base_url, alternatives, {"identity": ProviderCredentials(tokens)},
 )
 # Supply an external framework's provider directly instead to keep its lifecycle authoritative.
-transport = HttpxTransport.from_settings(settings, client)
+from sunday.httpx import transport_from_settings
+transport = transport_from_settings(settings, client)
 ```
 
 Managers retain expiry skew, coalesced renewal, refresh rotation and application-selected persistence.
@@ -322,10 +324,11 @@ manager on rejection, serializing concurrent rejection handling without maintain
 
 Request export materializes an optionally authorized native request once and hands its lifecycle to
 the consumer. Exported requests retain no Sunday-managed recovery state. Executing an operation through
-Sunday acquires once per attempt and retains the bounded safe-request recovery and SSE reconnect budget.
+Sunday invokes the request adapter once per attempt. Authentication responses do not trigger an implicit retry;
+an application may make another request after its credential owner handles the rejection.
 
-Migration: replace transport `tokenManager`/`token_manager` arguments with named
-`tokenProviders`/`token_providers` maps. Replace `TokenManagerFactory` hooks with explicitly constructed
+Migration: replace transport `tokenManager`/`token_manager` and `tokenProviders`/`token_providers` arguments
+with explicit request/response adapters. Replace `TokenManagerFactory` hooks with explicitly constructed
 managers supplied through provider credentials. Direct built-in OAuth providers are not implicitly cached;
 wrap them explicitly when Sunday should retain and refresh their tokens. For logout, stop outstanding
 requests and settle refresh commits before clearing the owning framework's or application's storage.
@@ -360,11 +363,10 @@ transport = HttpxTransport(
 )
 ```
 
-Managed attempts prepare and authorize, adapt the request, send, adapt the response, then
-apply normal response handling and bounded recovery. No response capability is inferred from
-a request adapter. Provider rejection feedback is independent of custom response adapters and
-runs even for unsafe methods or exhausted retry budgets. Only the token actually sent is rejected.
-Security receipts and retry counts are local to execution, never attached to exported requests.
+Managed attempts prepare, adapt the request, send, and adapt the response before normal handling.
+No response capability is inferred from a request adapter. Optional `AuthenticationAdapter` owns provider
+rejection feedback; transport execution does not classify or retry token rejection. Cancellation markers
+stop the exchange. Native request export detaches operation bindings and leaves execution to the consumer.
 
 Adapters surround each native HTTPX call. Borrowed-client event hooks, authentication flows,
 and transport-level connection recovery retain their native behavior; intermediate native
@@ -423,11 +425,12 @@ patterns, native-framework boundaries, and regression coverage used for this ref
 
 ### Application-owned authentication adapters
 
-A transport with a `request_adapter` and no `token_providers` delegates protected requests directly to the adapter.
+Transports delegate requests directly to `request_adapter` and responses to `response_adapter`.
 `request_security_bindings(request)` from `sunday.httpx` exposes the generated operation's immutable audience,
 scopes, and credential-placement metadata. Copies and adapter composition preserve this metadata without
 adding wire headers or token receipts. Adapters run for all operations and responses; applications select the
 exchanges they own and must preserve usable request/response streams.
 
-Standalone adapters do not enable token-recovery retries. Raise `RequestCancellationError` to stop an exchange,
-or return the response for ordinary handling. The optional provider-based integration retains its recovery policy.
+Raise `RequestCancellationError` to stop an exchange, or return the response for ordinary handling.
+Transports have no token-recovery retries. `AuthenticationAdapter`, `authentication_adapters`, and
+`transport_from_settings` provide optional provider composition outside transport execution.

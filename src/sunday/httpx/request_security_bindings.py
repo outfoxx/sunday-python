@@ -1,6 +1,7 @@
 """Operation metadata for HTTP adapters, independent of token acquisition and storage."""
 
 from collections.abc import Sequence
+from typing import cast
 
 import httpx
 
@@ -11,7 +12,7 @@ _KEY = "sunday.security_bindings"
 
 def request_security_bindings(request: httpx.Request) -> tuple[SecurityBinding, ...]:
     """Return the originating operation's bindings without credential receipts or token state."""
-    return request.extensions.get(_KEY, ())
+    return cast(tuple[SecurityBinding, ...], request.extensions.get(_KEY, ()))
 
 
 def _set_request_security_bindings(request: httpx.Request, bindings: Sequence[SecurityBinding]) -> httpx.Request:

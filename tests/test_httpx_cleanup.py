@@ -29,7 +29,6 @@ from sunday import (
     TokenRequest,
 )
 from sunday.httpx import HttpxOAuthTokenProvider, HttpxTransport, copy_request
-from sunday.httpx._security import AuthenticationRecoveryBudget
 
 pytestmark = pytest.mark.anyio
 
@@ -107,9 +106,7 @@ async def server() -> AsyncIterator[Server]:
 async def execute(transport: HttpxTransport, streaming: bool, spec: RequestSpec[Any]) -> httpx.Response:
     if not streaming:
         return await transport.execute_request(spec)
-    response = await transport._send_event_stream(
-        await transport._prepare_request(spec), recovery_budget=AuthenticationRecoveryBudget()
-    )
+    response = await transport._send_event_stream(await transport._prepare_request(spec))
     try:
         await response.aread()
         return response

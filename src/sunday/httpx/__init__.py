@@ -19,6 +19,7 @@ try:
         HttpxRequestAdapterCallable,
         HttpxTransport,
     )
+    from .authentication_adapter import AuthenticationAdapter, authentication_adapters, transport_from_settings
     from .request_adapter import RequestAdapter, RequestAdapters
     from .request_security_bindings import request_security_bindings
     from .response_adapter import ResponseAdapter, ResponseAdapters
@@ -28,6 +29,7 @@ except ModuleNotFoundError as error:
     raise ImportError("sunday.httpx requires the 'httpx' extra; install 'sunday-python[httpx]'") from error
 
 __all__ = [
+    "AuthenticationAdapter",
     "AuthorizationGrant",
     "HttpxEventSource",
     "HttpxEventSourceRequestFactory",
@@ -40,6 +42,8 @@ __all__ = [
     "RequestAdapters",
     "ResponseAdapter",
     "ResponseAdapters",
+    "authentication_adapters",
     "copy_request",
     "request_security_bindings",
+    "transport_from_settings",
 ]
