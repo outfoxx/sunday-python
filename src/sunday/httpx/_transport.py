@@ -40,6 +40,7 @@ from ._requests import BodyStream, copy_request, is_credentialed, redirect_reque
 from ._response_cleanup import close_response, protect_response
 from ._security import AuthenticationRecoveryBudget, RequestSecurity
 from .request_adapter import RequestAdapterLike, RequestAdapters
+from .request_security_bindings import _set_request_security_bindings
 from .response_adapter import ResponseAdapterLike, ResponseAdapters
 
 ResponseT = TypeVar("ResponseT")
@@ -120,7 +121,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
     async def transport_request(self, spec: RequestSpec[Any]) -> httpx.Request:
         """Materialize an optionally authorized request, handing its lifecycle to the consumer."""
         request = await self._prepare_request(spec)
-        if spec.security is not None:
+        if spec.security is not None and (self.token_providers or not self._request_adapter.adapters):
             await RequestSecurity(spec.security).authorize(request, self.token_providers)
         return await self._request_adapter.adapt(request)
 
@@ -138,7 +139,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
 
     def _build_request(self, spec: RequestSpec[Any]) -> httpx.Request:
         try:
-            return self._build_validated_request(spec)
+            return _set_request_security_bindings(self._build_validated_request(spec), spec.security or ())
         except (RequestEncodingError, RequestCancellationError):
             raise
         except (TypeError, ValueError) as error:
@@ -329,7 +330,11 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
         history: list[httpx.Response] = []
         while True:
             sent = copy_request(prepared)
-            authorized = await security.authorize(sent, self.token_providers) if security is not None else None
+            authorized = (
+                await security.authorize(sent, self.token_providers)
+                if security is not None and (self.token_providers or not self._request_adapter.adapters)
+                else None
+            )
             try:
                 sent = await self._request_adapter.adapt(sent)
             except BaseException as error:
@@ -350,7 +355,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                     if not recoverable:
                         raise TokenRejectedError()
                 response = await self._response_adapter.adapt(response, effective)
-                if budget.should_retry(effective, response):
+                if authorized is not None and budget.should_retry(effective, response):
                     await close_response(response)
                     continue
                 next_request = (

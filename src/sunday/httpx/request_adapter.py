@@ -11,6 +11,8 @@ from collections.abc import Awaitable, Callable
 import anyio
 import httpx
 
+from .request_security_bindings import _set_request_security_bindings, request_security_bindings
+
 
 class RequestAdapter(ABC):
     """Adapt once before each Sunday-managed native call, or once for export.
@@ -45,6 +47,8 @@ class RequestAdapters(RequestAdapter):
         """Run each adapter once, preserving native task cancellation."""
         for adapter in self.adapters:
             await anyio.lowlevel.checkpoint_if_cancelled()
+            bindings = request_security_bindings(request)
             request = await adapter.adapt(request) if isinstance(adapter, RequestAdapter) else await adapter(request)
+            _set_request_security_bindings(request, bindings)
         await anyio.lowlevel.checkpoint_if_cancelled()
         return request

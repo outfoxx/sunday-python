@@ -420,3 +420,14 @@ it runs before the new request-adapter chain. Prefer the independent `request_ad
 
 The [adapter lifecycle audit](docs/adapter-lifecycle-audit.md) records the recurring failure
 patterns, native-framework boundaries, and regression coverage used for this refactor.
+
+### Application-owned authentication adapters
+
+A transport with a `request_adapter` and no `token_providers` delegates protected requests directly to the adapter.
+`request_security_bindings(request)` from `sunday.httpx` exposes the generated operation's immutable audience,
+scopes, and credential-placement metadata. Copies and adapter composition preserve this metadata without
+adding wire headers or token receipts. Adapters run for all operations and responses; applications select the
+exchanges they own and must preserve usable request/response streams.
+
+Standalone adapters do not enable token-recovery retries. Raise `RequestCancellationError` to stop an exchange,
+or return the response for ordinary handling. The optional provider-based integration retains its recovery policy.

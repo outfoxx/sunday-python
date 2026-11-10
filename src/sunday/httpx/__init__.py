@@ -20,6 +20,7 @@ try:
         HttpxTransport,
     )
     from .request_adapter import RequestAdapter, RequestAdapters
+    from .request_security_bindings import request_security_bindings
     from .response_adapter import ResponseAdapter, ResponseAdapters
 except ModuleNotFoundError as error:
     if error.name not in {"anyio", "httpx"}:
@@ -40,4 +41,5 @@ __all__ = [
     "ResponseAdapter",
     "ResponseAdapters",
     "copy_request",
+    "request_security_bindings",
 ]
