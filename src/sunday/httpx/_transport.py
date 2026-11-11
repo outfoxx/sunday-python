@@ -35,6 +35,7 @@ from ..transport import BaseTransport
 from ..uri import URITemplate
 from ._async import complete, run_io
 from ._diagnostics import diagnostic_error, diagnostic_request
+from ._request_context import clear_request_context
 from ._requests import BodyStream, copy_request, is_credentialed, redirect_request
 from ._response_cleanup import close_response, protect_response
 from .request_adapter import RequestAdapterLike, RequestAdapters
@@ -106,7 +107,7 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
     async def transport_request(self, spec: RequestSpec[Any]) -> httpx.Request:
         """Materialize an optionally authorized request, handing its lifecycle to the consumer."""
         request = await self._prepare_request(spec)
-        return _set_request_security_bindings(await self._request_adapter.adapt(request), ())
+        return clear_request_context(_set_request_security_bindings(await self._request_adapter.adapt(request), ()))
 
     async def _prepare_request(self, spec: RequestSpec[Any]) -> httpx.Request:
         """Build without adapting; execution and export each own their adaptation step."""

@@ -479,3 +479,99 @@ async def test_failed_rejection_closes_response_and_sanitizes_provider_error() -
             await transport.execute_request(RequestSpec("GET", "/value", security=(BINDING,)))
         assert "private-provider-detail" not in str(failure.value)
         assert response.is_closed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("outcome", ["response", "request_error", "status_error"])
+async def test_private_receipts_do_not_escape_export_or_diagnostics(outcome: str) -> None:
+    manager = TokenManager(Provider())
+    spec: RequestSpec[None] = RequestSpec("GET", "/value", security=(BINDING,))
+    sent: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        assert "sunday.request_context" in request.extensions
+        if outcome == "request_error":
+            raise httpx.ConnectError("offline", request=request)
+        if outcome == "status_error":
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("failed", request=request, response=response)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
+        transport = HttpxTransport(client, **authentication_adapters({"identity": manager}))
+        exported = await transport.transport_request(spec)
+        assert set(exported.extensions) == {"timeout"}
+        assert exported.headers["authorization"] == "Bearer access-1"
+        if outcome == "response":
+            diagnostic = (await transport.execute_request(spec)).request
+        else:
+            with pytest.raises(httpx.HTTPError) as caught:
+                await transport.execute_request(spec)
+            diagnostic = caught.value.request
+        assert diagnostic.headers["authorization"] == "[redacted]"
+        assert set(diagnostic.extensions) == {"timeout", "sunday.security_bindings"}
+        assert "sunday.request_context" in sent[0].extensions
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["stream", "source"])
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("factory_bindings", [False, True])
+async def test_factory_event_requests_receive_operation_bindings(
+    kind: str, configured: bool, factory_bindings: bool
+) -> None:
+    import asyncio
+
+    import anyio
+
+    from sunday import EventSourceState, EventStreamOptions
+    from sunday.httpx import (
+        HttpxEventSource,
+        HttpxEventStream,
+        StandardAuthenticationAdapter,
+        request_security_bindings,
+    )
+    from sunday.httpx.request_security_bindings import _set_request_security_bindings
+
+    provider = Provider()
+    sent: list[httpx.Request] = []
+    spec: RequestSpec[None] = RequestSpec("GET", "/value", security=None if factory_bindings else (BINDING,))
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        assert request_security_bindings(request) == (BINDING,)
+        assert request.headers["authorization"] == "Bearer access-1"
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
+        adapter = StandardAuthenticationAdapter({"identity": provider} if configured else {})
+        transport = HttpxTransport(client, request_adapter=adapter, response_adapter=adapter)
+
+        async def factory(headers: tuple[tuple[str, str], ...]) -> httpx.Request:
+            request = client.build_request("GET", "/value", headers=headers)
+            return _set_request_security_bindings(request, (BINDING,)) if factory_bindings else request
+
+        with anyio.fail_after(2):
+            if kind == "stream":
+                stream: HttpxEventStream[None] = HttpxEventStream(
+                    transport, spec, lambda _: None, request_factory=factory, options=EventStreamOptions(retry=0)
+                )
+                if configured:
+                    assert [event async for event in stream] == []
+                else:
+                    with pytest.raises(RequestCancellationError):
+                        _ = [event async for event in stream]
+            else:
+                errors: list[BaseException | None] = []
+                source = HttpxEventSource(transport, factory, spec=spec, options=EventStreamOptions(retry=0))
+                source.on_error = errors.append
+                source.connect()
+                while source.ready_state is not EventSourceState.CLOSED:
+                    await asyncio.sleep(0)
+                source.close()
+                await source._wait_closed()
+                assert len(errors) == (0 if configured else 1)
+                if errors:
+                    assert isinstance(errors[0], RequestCancellationError)
+        assert len(sent) == (1 if configured else 0)

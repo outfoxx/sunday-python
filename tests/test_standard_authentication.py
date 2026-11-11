@@ -1,10 +1,12 @@
 """Standard settings composition and custom adapters share generated operation contracts."""
 
+import anyio
 import httpx
 import pytest
 
 from sunday import (
     ClientSettings,
+    EventStreamOptions,
     ProviderCredentials,
     RequestCancellationError,
     RequestSpec,
@@ -12,6 +14,7 @@ from sunday import (
     SecurityTransport,
     TokenConfiguration,
     TokenManager,
+    TokenProviderError,
     TokenRequest,
     TokenSet,
 )
@@ -104,3 +107,46 @@ async def test_same_generated_operation_custom_plain_and_explicit_missing_policy
             await missing.execute_request(RequestSpec("GET", "/value"))
     assert calls == 1
     assert sent == ["Custom credential", "", ""]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_feedback_failure_still_stops_event_stream(cancel: bool) -> None:
+    failure = RequestCancellationError("provider stop") if cancel else TokenProviderError("temporary")
+    rejections = sent = 0
+    fail_acquisition = False
+
+    class Provider:
+        identity = "feedback"
+
+        def configure(self, binding: SecurityBinding) -> TokenConfiguration:
+            return TokenConfiguration("client")
+
+        async def acquire(self, request: TokenRequest) -> TokenSet:
+            if fail_acquisition:
+                raise TokenProviderError("temporary")
+            return TokenSet("access")
+
+        async def reject(self, request: TokenRequest, rejected_token: str) -> bool:
+            nonlocal rejections
+            rejections += 1
+            raise failure
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal sent
+        sent += 1
+        return httpx.Response(401, headers={"WWW-Authenticate": "Bearer error=invalid_token"})
+
+    authentication = StandardAuthenticationAdapter({"identity": Provider()})
+    async with httpx.AsyncClient(base_url="https://example.test", transport=httpx.MockTransport(respond)) as client:
+        transport = HttpxTransport(client, request_adapter=authentication, response_adapter=authentication)
+        with anyio.fail_after(2), pytest.raises(RequestCancellationError) as caught:
+            async for _ in transport.event_stream(SPEC, lambda event: event, options=EventStreamOptions(retry=0)):
+                pytest.fail("Rejected stream must not emit")
+        if cancel:
+            assert caught.value is failure
+        assert sent == rejections == 1
+        fail_acquisition = True
+        with pytest.raises(httpx.TransportError) as temporary:
+            await transport.execute_request(SPEC)
+        assert not isinstance(temporary.value, RequestCancellationError)
+        assert sent == 1

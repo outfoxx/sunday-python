@@ -12,6 +12,7 @@ import httpx
 
 from ..request_cancellation_error import RequestCancellationError
 from ..token_provider import TokenProvider, TokenProviderError, TokenRejectedError
+from ._request_context import request_context
 from ._security import RequestSecurity
 from .request_adapter import RequestAdapterLike, RequestAdapters
 from .request_security_bindings import request_security_bindings
@@ -27,7 +28,7 @@ class AuthenticationAdapter:
 
     def __init__(self, providers: Mapping[str, TokenProvider]) -> None:
         self._providers = dict(providers)
-        self._receipt = f"sunday.authentication.{id(self)}"
+        self._receipt = object()
 
     @overload
     async def __call__(self, value: httpx.Request) -> httpx.Request: ...
@@ -42,7 +43,7 @@ class AuthenticationAdapter:
         if request is not None:
             assert isinstance(value, httpx.Response)
             security = (
-                cast(RequestSecurity | None, request.extensions.get(self._receipt))
+                cast(RequestSecurity | None, request_context(request).get(self._receipt))
                 if request_security_bindings(request)
                 else None
             )
@@ -63,7 +64,7 @@ class AuthenticationAdapter:
         if not bindings:
             return value
         try:
-            value.extensions[self._receipt] = await RequestSecurity(bindings).authorize(value, self._providers)
+            request_context(value)[self._receipt] = await RequestSecurity(bindings).authorize(value, self._providers)
         except TokenProviderError as error:
             if error.reason != "temporary":
                 raise RequestCancellationError(str(error)) from error

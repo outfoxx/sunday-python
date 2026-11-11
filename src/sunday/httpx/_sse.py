@@ -28,6 +28,7 @@ from ..sse import EventParser, EventStreamOptions, ServerSentEvent
 from ._async import complete, run_io
 from ._reconnect import _ReconnectPolicy
 from ._response_cleanup import close_response, in_response_cleanup
+from .request_security_bindings import _set_request_security_bindings
 
 if TYPE_CHECKING:
     from ._transport import HttpxEventSourceRequestFactory, HttpxTransport
@@ -186,6 +187,8 @@ class HttpxEventStream[EventT]:
                         else:
                             request_value = self._request_factory(tuple(headers))
                             request = await request_value if inspect.isawaitable(request_value) else request_value
+                            if self._spec.security is not None:
+                                _set_request_security_bindings(request, self._spec.security)
                         self._disable_httpx_read_timeout(request)
                         response = await self._transport._send_event_stream(
                             request,

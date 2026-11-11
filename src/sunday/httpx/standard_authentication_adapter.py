@@ -5,6 +5,7 @@ from typing import overload
 
 import httpx
 
+from ..request_cancellation_error import RequestCancellationError
 from ..token_provider import TokenProvider
 from .authentication_adapter import AuthenticationAdapter
 from .bearer_token_rejection_adapter import BearerTokenRejectionAdapter
@@ -40,4 +41,11 @@ class StandardAuthenticationAdapter:
         assert isinstance(value, httpx.Response)
         if not request_security_bindings(request):
             return value
-        return await self._responses.adapt(value, request)
+        try:
+            return await self._responses.adapt(value, request)
+        except RequestCancellationError:
+            raise
+        except Exception:
+            # Feedback failure must not bypass the explicitly selected stop policy.
+            await BearerTokenRejectionAdapter().adapt(value, request)
+            raise

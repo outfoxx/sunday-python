@@ -3,6 +3,7 @@
 import httpx
 
 from ..request_cancellation_error import RequestCancellationError
+from ._request_context import clear_request_context
 from ._requests import copy_request
 from .request_security_bindings import request_security_bindings
 
@@ -10,8 +11,6 @@ from .request_security_bindings import request_security_bindings
 def diagnostic_request(request: httpx.Request) -> httpx.Request:
     """Remove sensitive values from native response and failure diagnostics."""
     bindings = request_security_bindings(request)
-    if not bindings:
-        return request
     url, headers = request.url, httpx.Headers(request.headers)
     for binding in bindings:
         transport = binding.transport
@@ -21,7 +20,7 @@ def diagnostic_request(request: httpx.Request) -> httpx.Request:
             headers[transport.name] = "[redacted]"
         else:
             headers["cookie"] = "[redacted]"
-    return copy_request(request, url=url, headers=headers)
+    return clear_request_context(copy_request(request, url=url, headers=headers))
 
 
 def diagnostic_error(error: BaseException, request: httpx.Request) -> BaseException:
