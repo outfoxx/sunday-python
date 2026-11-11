@@ -307,7 +307,10 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
             try:
                 sent = await self._request_adapter.adapt(sent)
             except BaseException as error:
-                raise diagnostic_error(error, sent) from None
+                diagnostic = diagnostic_error(error, sent)
+                if diagnostic is error:
+                    raise
+                raise diagnostic from None
             response = await self._send_httpx(sent)
             effective = sent
             try:
@@ -337,7 +340,10 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                 return response
             except BaseException as error:
                 await close_response(response, error)
-                raise diagnostic_error(error, effective) from None
+                diagnostic = diagnostic_error(error, effective)
+                if diagnostic is error:
+                    raise
+                raise diagnostic from None
 
     async def _send_httpx(
         self,
@@ -366,8 +372,8 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                     lambda: self.client.send(request, stream=True, follow_redirects=False),
                     discard=close_response,
                 )
-        except BaseException as error:
-            error = diagnostic_error(error, request)
+        except BaseException as original:
+            error = diagnostic_error(original, request)
             try:
                 self._observe(
                     TransportEvent(
@@ -381,6 +387,8 @@ class HttpxTransport(BaseTransport[httpx.Request, httpx.Response]):
                 )
             except BaseException:
                 error.add_note("Reporting the HTTP request failure also failed")
+            if error is original:
+                raise
             raise error from None
         protect_response(response)
         try:

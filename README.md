@@ -290,11 +290,25 @@ field configuration above. A literal string `"UNSET"` remains an ordinary string
 
 ## Application-owned token lifecycle
 
-Transports accept only request and response adapters; they have no token-provider option or authentication retry logic.
-The optional `AuthenticationAdapter` bridges named providers to these contracts. Settings factories compose it explicitly
-without adding a cache. External authentication frameworks can implement the adapters directly.
+Transport constructors perform no authentication or authorization by default. They accept request and response
+adapters, with no token-provider option or authentication retry loop. External authentication frameworks can
+implement these adapters directly, without using Sunday's token or security classes.
+
+The optional `AuthenticationAdapter` acquires credentials for declared bindings, reports missing providers,
+and sends matching rejection feedback to the credential owner. Install it explicitly in each desired slot;
+installing a request adapter alone does not install response behavior. It adds no cache.
+
+`BearerTokenRejectionAdapter` is a separate, opt-in response policy. It throws the cancellation marker when
+an initiating request sent a bearer credential and its response is 401 with an explicit Bearer `invalid_token`
+challenge. It leaves all other responses and all bodies untouched. Compose it after `AuthenticationAdapter`
+when provider feedback should run before cancellation. It has no counter, renewal, or replay behavior.
+The removed `AuthenticationRecoveryBudget` has no implicit replacement: applications choose their own
+recovery policy, and a cancellation-marked error always stops the exchange, retries, and SSE reconnections.
 An external framework (for example Auth0) remains responsible for storage, renewal and logout.
 Return only its access token and optional expiry; keep its refresh token inside that framework.
+
+The provider-settings convenience `transport_from_settings(...)` explicitly installs provider adapters.
+Use the ordinary transport constructor with your own adapters when you want to own the exchange entirely.
 
 For Sunday's caching and refresh lifecycle, explicitly supply a `TokenManager` as the provider:
 

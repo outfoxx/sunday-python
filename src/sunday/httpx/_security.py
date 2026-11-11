@@ -151,35 +151,6 @@ def _invalid_bearer_challenge(header: str) -> bool:
     return False
 
 
-class AuthenticationRecoveryBudget:
-    """One authentication recovery across an invocation, including event reconnects."""
-
-    def __init__(self) -> None:
-        self._used = False
-
-    def should_retry(self, request: httpx.Request, response: httpx.Response) -> bool:
-        """Allow one bodyless safe-method retry after explicit token rejection."""
-        if (
-            request.method not in {"GET", "HEAD", "OPTIONS"}
-            or response.status_code != 401
-            or _bearer_token(request) is None
-            or not _invalid_bearer_challenge(response.headers.get("www-authenticate", ""))
-        ):
-            return False
-        try:
-            if request.content:
-                return False
-        except httpx.RequestNotRead:
-            return False
-        return self.consume()
-
-    def consume(self) -> bool:
-        if self._used:
-            return False
-        self._used = True
-        return True
-
-
 def _bearer_token(request: httpx.Request) -> str | None:
     parts = request.headers.get("authorization", "").split()
     return parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else None

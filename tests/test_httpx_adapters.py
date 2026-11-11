@@ -1019,3 +1019,59 @@ async def test_managed_status_errors_preserve_response_and_cancellation_identity
         if stop:
             assert error.request is sent[0]
             assert error.response.request is sent[0]
+
+
+@pytest.mark.parametrize("stage", ["request", "send", "response"])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_unchanged_failures_preserve_their_explicit_cause(stage, cancel):
+    cause = ValueError("application cause")
+    failure = RequestCancellationError("stopped") if cancel else RuntimeError("failed")
+
+    async def request_adapter(request):
+        if stage == "request":
+            raise failure from cause
+        return request
+
+    async def respond(request):
+        if stage == "send":
+            raise failure from cause
+        return httpx.Response(200)
+
+    async def response_adapter(response, request):
+        raise failure from cause
+
+    async with (
+        httpx.AsyncClient(base_url="https://example.test", transport=httpx.MockTransport(respond)) as client,
+        HttpxTransport(client, request_adapter=request_adapter, response_adapter=response_adapter) as transport,
+    ):
+        with pytest.raises(type(failure)) as caught:
+            await transport.execute_request(RequestSpec("GET", "/value"))
+    assert caught.value is failure
+    assert caught.value.__cause__ is cause
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("status", [200, 401, 403])
+@pytest.mark.parametrize(
+    "challenge", ["Bearer error=invalid_token", "Basic error=invalid_token", "Bearer error=insufficient_scope"]
+)
+async def test_explicit_bearer_rejection_policy_preserves_bodies(method, status, challenge):
+    from sunday.httpx import BearerTokenRejectionAdapter
+
+    request = httpx.Request(
+        method, "https://example.test", headers={"Authorization": "Bearer fixture"}, content=b"request"
+    )
+    body = Body()
+    response = httpx.Response(status, headers={"WWW-Authenticate": challenge}, stream=body)
+    adapter = BearerTokenRejectionAdapter()
+    if status == 401 and challenge == "Bearer error=invalid_token":
+        for _ in range(2):
+            with pytest.raises(RequestCancellationError):
+                await adapter.adapt(response, request)
+    else:
+        assert await adapter.adapt(response, request) is response
+    del request.headers["Authorization"]
+    assert await adapter.adapt(response, request) is response
+    assert request.content == b"request"
+    assert body.reads == 0
+    await response.aclose()

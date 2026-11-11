@@ -20,6 +20,7 @@ try:
         HttpxTransport,
     )
     from .authentication_adapter import AuthenticationAdapter, authentication_adapters, transport_from_settings
+    from .bearer_token_rejection_adapter import BearerTokenRejectionAdapter
     from .request_adapter import RequestAdapter, RequestAdapters
     from .request_security_bindings import request_security_bindings
     from .response_adapter import ResponseAdapter, ResponseAdapters
@@ -31,6 +32,7 @@ except ModuleNotFoundError as error:
 __all__ = [
     "AuthenticationAdapter",
     "AuthorizationGrant",
+    "BearerTokenRejectionAdapter",
     "HttpxEventSource",
     "HttpxEventSourceRequestFactory",
     "HttpxEventStream",
