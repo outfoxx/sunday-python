@@ -19,15 +19,21 @@ try:
         HttpxRequestAdapterCallable,
         HttpxTransport,
     )
+    from .authentication_adapter import AuthenticationAdapter, authentication_adapters, transport_from_settings
+    from .bearer_token_rejection_adapter import BearerTokenRejectionAdapter
     from .request_adapter import RequestAdapter, RequestAdapters
+    from .request_security_bindings import request_security_bindings
     from .response_adapter import ResponseAdapter, ResponseAdapters
+    from .standard_authentication_adapter import StandardAuthenticationAdapter
 except ModuleNotFoundError as error:
     if error.name not in {"anyio", "httpx"}:
         raise
     raise ImportError("sunday.httpx requires the 'httpx' extra; install 'sunday-python[httpx]'") from error
 
 __all__ = [
+    "AuthenticationAdapter",
     "AuthorizationGrant",
+    "BearerTokenRejectionAdapter",
     "HttpxEventSource",
     "HttpxEventSourceRequestFactory",
     "HttpxEventStream",
@@ -39,5 +45,9 @@ __all__ = [
     "RequestAdapters",
     "ResponseAdapter",
     "ResponseAdapters",
+    "StandardAuthenticationAdapter",
+    "authentication_adapters",
     "copy_request",
+    "request_security_bindings",
+    "transport_from_settings",
 ]

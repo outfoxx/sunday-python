@@ -101,13 +101,13 @@ authoritative.
 ## Profiled credentials
 
 Generated operations carry selected `SecurityBinding` metadata in `RequestSpec.security`. Applications
-pass named providers directly to `HttpxTransport(token_providers=...)`.
+compose providers explicitly with `HttpxTransport(..., **authentication_adapters(providers))`.
 Providers and token storage stay in the application; generated code contains no credentials.
 
 ```python
 import httpx
 from sunday import TokenManager
-from sunday.httpx import HttpxOAuthTokenProvider, HttpxTransport
+from sunday.httpx import HttpxOAuthTokenProvider, HttpxTransport, authentication_adapters
 
 
 def create_transport(client: httpx.AsyncClient, client_secret: str) -> HttpxTransport:
@@ -121,7 +121,7 @@ def create_transport(client: httpx.AsyncClient, client_secret: str) -> HttpxTran
     )
     return HttpxTransport(
         client,
-        token_providers={"service-identity": TokenManager(provider)},
+        **authentication_adapters({"service-identity": TokenManager(provider)}),
     )
 ```
 
@@ -288,12 +288,68 @@ is a typed, copyable, picklable singleton; it is omitted from JSON Schema and se
 field configuration above. A literal string `"UNSET"` remains an ordinary string value. Keep the
 `default_factory` and `exclude_if` configuration when defining patch models manually.
 
+## Explicit standard authentication
+
+Choose standard authentication once in the transport factory supplied to generated clients.
+`StandardAuthenticationAdapter` composes credential attachment, missing-provider checks, rejection
+feedback, and terminal bearer-rejection cancellation. It delegates to the existing adapters, including
+their body ownership rules, and ignores public/detached operation responses. Feedback runs before
+cancellation. There is no hidden replay; a later explicit request can obtain renewed credentials.
+
+The standard settings helper selects this policy on both sides. Lower-level `AuthenticationAdapter`
+remains available when an application wants feedback without the standard stop policy. Ordinary
+transport constructors perform no authentication and do not install this composition.
+
+```python
+from sunday.httpx import HttpxTransport, transport_from_settings
+
+# Keep the HTTPX client open for the lifetime of the generated clients.
+async with httpx.AsyncClient(base_url=base_url) as client:
+    def standard_factory(settings):
+        return transport_from_settings(settings, client)
+
+    # Pass standard_factory to the generated configuration-based factory,
+    # or construct a generated service with this caller-owned transport:
+    custom_transport = HttpxTransport(
+        client, request_adapter=auth0_link, response_adapter=auth0_link,
+    )
+```
+
+Caching is a separate explicit choice: construct `TokenManager` around a Sunday OAuth provider and
+supply that manager through provider credentials to the generated factory. This retains expiry renewal,
+refresh rotation, and application-selected storage. A provider returned by an OAuth credential factory
+can likewise be an explicitly constructed manager. Supplied external providers are used unchanged;
+standard composition never wraps them, creates a second cache, closes them, or clears their storage.
+Keep managers at application/session scope, share them across clients using the same credential lifecycle,
+and settle outstanding requests before closing managers or clearing credentials.
+
+Static bearer, basic, and API-key credentials use their declared placement without an OAuth cache.
+Only an explicit Bearer `invalid_token` challenge for a sent bearer credential invokes the bearer stop
+policy; 403s and unrelated challenges retain ordinary response handling. Authentication selection and
+credential validation in generated settings remain active for the standard path. The direct-transport
+path lets a custom adapter own those choices using operation metadata.
+
 ## Application-owned token lifecycle
 
-Transports accept named `TokenProvider` instances directly. Settings preserve supplied providers and
-never add a token cache. Every managed network attempt asks its provider for current credentials.
+Transport constructors perform no authentication or authorization by default. They accept request and response
+adapters, with no token-provider option or authentication retry loop. External authentication frameworks can
+implement these adapters directly, without using Sunday's token or security classes.
+
+The optional `AuthenticationAdapter` acquires credentials for declared bindings, reports missing providers,
+and sends matching rejection feedback to the credential owner. Install it explicitly in each desired slot;
+installing a request adapter alone does not install response behavior. It adds no cache.
+
+`BearerTokenRejectionAdapter` is a separate, opt-in response policy. It throws the cancellation marker when
+an initiating request sent a bearer credential and its response is 401 with an explicit Bearer `invalid_token`
+challenge. It leaves all other responses and all bodies untouched. Compose it after `AuthenticationAdapter`
+when provider feedback should run before cancellation. It has no counter, renewal, or replay behavior.
+The removed `AuthenticationRecoveryBudget` has no implicit replacement: applications choose their own
+recovery policy, and a cancellation-marked error always stops the exchange, retries, and SSE reconnections.
 An external framework (for example Auth0) remains responsible for storage, renewal and logout.
 Return only its access token and optional expiry; keep its refresh token inside that framework.
+
+The provider-settings convenience `transport_from_settings(...)` explicitly installs the standard authentication composition.
+Use the ordinary transport constructor with your own adapters when you want to own the exchange entirely.
 
 For Sunday's caching and refresh lifecycle, explicitly supply a `TokenManager` as the provider:
 
@@ -303,7 +359,8 @@ settings = ClientSettings.resolve(
     base_url, alternatives, {"identity": ProviderCredentials(tokens)},
 )
 # Supply an external framework's provider directly instead to keep its lifecycle authoritative.
-transport = HttpxTransport.from_settings(settings, client)
+from sunday.httpx import transport_from_settings
+transport = transport_from_settings(settings, client)
 ```
 
 Managers retain expiry skew, coalesced renewal, refresh rotation and application-selected persistence.
@@ -322,10 +379,11 @@ manager on rejection, serializing concurrent rejection handling without maintain
 
 Request export materializes an optionally authorized native request once and hands its lifecycle to
 the consumer. Exported requests retain no Sunday-managed recovery state. Executing an operation through
-Sunday acquires once per attempt and retains the bounded safe-request recovery and SSE reconnect budget.
+Sunday invokes the request adapter once per attempt. Authentication responses do not trigger an implicit retry;
+an application may make another request after its credential owner handles the rejection.
 
-Migration: replace transport `tokenManager`/`token_manager` arguments with named
-`tokenProviders`/`token_providers` maps. Replace `TokenManagerFactory` hooks with explicitly constructed
+Migration: replace transport `tokenManager`/`token_manager` and `tokenProviders`/`token_providers` arguments
+with explicit request/response adapters. Replace `TokenManagerFactory` hooks with explicitly constructed
 managers supplied through provider credentials. Direct built-in OAuth providers are not implicitly cached;
 wrap them explicitly when Sunday should retain and refresh their tokens. For logout, stop outstanding
 requests and settle refresh commits before clearing the owning framework's or application's storage.
@@ -360,11 +418,10 @@ transport = HttpxTransport(
 )
 ```
 
-Managed attempts prepare and authorize, adapt the request, send, adapt the response, then
-apply normal response handling and bounded recovery. No response capability is inferred from
-a request adapter. Provider rejection feedback is independent of custom response adapters and
-runs even for unsafe methods or exhausted retry budgets. Only the token actually sent is rejected.
-Security receipts and retry counts are local to execution, never attached to exported requests.
+Managed attempts prepare, adapt the request, send, and adapt the response before normal handling.
+No response capability is inferred from a request adapter. Optional `AuthenticationAdapter` owns provider
+rejection feedback; transport execution does not classify or retry token rejection. Cancellation markers
+stop the exchange. Native request export detaches operation bindings and leaves execution to the consumer.
 
 Adapters surround each native HTTPX call. Borrowed-client event hooks, authentication flows,
 and transport-level connection recovery retain their native behavior; intermediate native
@@ -420,3 +477,15 @@ it runs before the new request-adapter chain. Prefer the independent `request_ad
 
 The [adapter lifecycle audit](docs/adapter-lifecycle-audit.md) records the recurring failure
 patterns, native-framework boundaries, and regression coverage used for this refactor.
+
+### Application-owned authentication adapters
+
+Transports delegate requests directly to `request_adapter` and responses to `response_adapter`.
+`request_security_bindings(request)` from `sunday.httpx` exposes the generated operation's immutable audience,
+scopes, and credential-placement metadata. Copies and adapter composition preserve this metadata without
+adding wire headers or token receipts. Adapters run for all operations and responses; applications select the
+exchanges they own and must preserve usable request/response streams.
+
+Raise `RequestCancellationError` to stop an exchange, or return the response for ordinary handling.
+Transports have no token-recovery retries. `AuthenticationAdapter`, `authentication_adapters`, and
+`transport_from_settings` provide optional provider composition outside transport execution.

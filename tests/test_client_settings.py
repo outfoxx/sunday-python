@@ -22,7 +22,7 @@ from sunday import (
     TokenSet,
     provider_credentials,
 )
-from sunday.httpx import AuthorizationGrant, HttpxTransport
+from sunday.httpx import AuthorizationGrant, transport_from_settings
 
 BINDING = SecurityBinding(
     scheme="identity",
@@ -41,10 +41,10 @@ def test_static_settings_and_httpx_adapter() -> None:
 
     async def check() -> None:
         async with httpx.AsyncClient(base_url=settings.base_url) as client:
-            transport = HttpxTransport.from_settings(settings, client)
+            transport = transport_from_settings(settings, client)
             assert transport.client is client
-            assert transport.token_providers
-            lease = await provider_credentials(transport.token_providers[BINDING.provider], BINDING)
+            assert settings.token_providers
+            lease = await provider_credentials(settings.token_providers[BINDING.provider], BINDING)
             assert lease.tokens.access_token == "private-token"
 
     asyncio.run(check())
@@ -68,7 +68,7 @@ def test_settings_snapshot_and_adapter_endpoint_validation() -> None:
     async def check() -> None:
         async with httpx.AsyncClient(base_url="https://other.example") as client:
             with pytest.raises(ValueError, match="base URL"):
-                HttpxTransport.from_settings(settings, client)
+                transport_from_settings(settings, client)
 
     asyncio.run(check())
 
@@ -199,9 +199,9 @@ def test_httpx_adapter_normalizes_both_endpoint_urls() -> None:
 
     async def check() -> None:
         async with httpx.AsyncClient(base_url=settings.base_url) as client:
-            assert HttpxTransport.from_settings(settings, client).client is client
+            assert transport_from_settings(settings, client).client is client
         async with httpx.AsyncClient(base_url="https://api.example/different") as client:
             with pytest.raises(ValueError):
-                HttpxTransport.from_settings(settings, client)
+                transport_from_settings(settings, client)
 
     asyncio.run(check())

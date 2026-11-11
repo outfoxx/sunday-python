@@ -2,7 +2,6 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any
@@ -13,6 +12,7 @@ import pytest
 from sunday import (
     Operation,
     OperationSpec,
+    RequestCancellationError,
     RequestSpec,
     ResponseSpec,
     SecurityBinding,
@@ -26,7 +26,7 @@ from sunday import (
     TransportEvent,
     UnexpectedResponse,
 )
-from sunday.httpx import HttpxTransport
+from sunday.httpx import HttpxTransport, authentication_adapters
 
 BINDING = SecurityBinding(
     scheme="token",
@@ -71,7 +71,7 @@ async def send(transport: HttpxTransport, spec: RequestSpec[Any]) -> httpx.Respo
 
 
 @pytest.mark.anyio
-async def test_complete_credentials_and_one_safe_recovery() -> None:
+async def test_complete_credentials_and_explicit_subsequent_renewal() -> None:
     provider = Provider()
     authorization: list[str] = []
 
@@ -82,7 +82,9 @@ async def test_complete_credentials_and_one_safe_recovery() -> None:
         return httpx.Response(204)
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        transport = HttpxTransport(client, token_providers={"identity": TokenManager(provider)})
+        transport = HttpxTransport(client, **authentication_adapters({"identity": TokenManager(provider)}, None, None))
+        response = await send(transport, RequestSpec("GET", "/value", security=(BINDING,)))
+        assert response.status_code == 401
         response = await send(transport, RequestSpec("GET", "/value", security=(BINDING,)))
     assert response.status_code == 204
     assert response.request.headers["authorization"] == "[redacted]"
@@ -101,8 +103,8 @@ async def test_complete_credentials_and_one_safe_recovery() -> None:
         ("GET", 401, 'Bearer error="INVALID_TOKEN"', 1),
         ("GET", 401, 'Basic realm="x", error="invalid_token"', 1),
         ("GET", 401, 'Bearer error="insufficient_scope"', 1),
-        ("GET", 401, 'Bearer realm="x,y", error="invalid_token"', 2),
-        ("GET", 401, 'Basic realm="x", Bearer error="invalid_token"', 2),
+        ("GET", 401, 'Bearer realm="x,y", error="invalid_token"', 1),
+        ("GET", 401, 'Basic realm="x", Bearer error="invalid_token"', 1),
         ("GET", 401, 'Bearer realm="unterminated, error=invalid_token', 1),
     ],
 )
@@ -119,7 +121,7 @@ async def test_recovery_is_bounded_safe_and_never_uses_403(
         return httpx.Response(status, headers={"WWW-Authenticate": challenge})
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        transport = HttpxTransport(client, token_providers={"identity": TokenManager(provider)})
+        transport = HttpxTransport(client, **authentication_adapters({"identity": TokenManager(provider)}, None, None))
         operation: Operation[None, httpx.Request, httpx.Response] = Operation(
             transport,
             OperationSpec(RequestSpec(method, "/value", security=(BINDING,)), (ResponseSpec(204),)),
@@ -140,7 +142,7 @@ async def test_native_request_export_delegates_lifecycle_and_public_operations_d
 
     manager = TokenManager({"identity": provider})
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        transport = HttpxTransport(client, token_providers={"identity": manager})
+        transport = HttpxTransport(client, **authentication_adapters({"identity": manager}, None, None))
         request = await transport.transport_request(RequestSpec("GET", "/value", security=(BINDING,)))
         await transport.transport_response(request)
         await manager.invalidate(await manager.credentials(BINDING))
@@ -183,7 +185,9 @@ async def test_all_and_credentials_are_attached_without_losing_body_and_diagnost
         return httpx.Response(204)
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        transport = HttpxTransport(client, token_providers={"identity": TokenManager(provider)}, observers=(observer,))
+        transport = HttpxTransport(
+            client, observers=(observer,), **authentication_adapters({"identity": TokenManager(provider)}, None, None)
+        )
         response = await send(
             transport,
             RequestSpec(
@@ -208,11 +212,13 @@ async def test_conflicts_and_missing_provider_fail_before_network() -> None:
         return httpx.Response(204)
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        missing = HttpxTransport(client)
-        with pytest.raises(TokenProviderError):
+        missing = HttpxTransport(client, **authentication_adapters({}))
+        with pytest.raises(RequestCancellationError):
             await send(missing, RequestSpec("GET", "/value", security=(BINDING,)))
-        transport = HttpxTransport(client, token_providers={"identity": TokenManager(Provider())})
-        with pytest.raises(TokenProviderError):
+        transport = HttpxTransport(
+            client, **authentication_adapters({"identity": TokenManager(Provider())}, None, None)
+        )
+        with pytest.raises(RequestCancellationError):
             await send(
                 transport,
                 RequestSpec(
@@ -222,7 +228,7 @@ async def test_conflicts_and_missing_provider_fail_before_network() -> None:
                     headers=(("Authorization", "existing"),),
                 ),
             )
-        with pytest.raises(TokenProviderError):
+        with pytest.raises(RequestCancellationError):
             await send(transport, RequestSpec("GET", "/value", security=(BINDING, BINDING)))
     assert sends == 0
 
@@ -237,7 +243,7 @@ async def test_transport_errors_and_observers_do_not_leak_query_credentials() ->
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
         transport = HttpxTransport(
-            client, token_providers={"identity": TokenManager(Provider())}, observers=(observer,)
+            client, observers=(observer,), **authentication_adapters({"identity": TokenManager(Provider())}, None, None)
         )
         with pytest.raises(httpx.ConnectError) as error:
             await send(transport, RequestSpec("GET", "/value", security=(binding,)))
@@ -263,14 +269,16 @@ async def test_managed_credentials_cannot_follow_redirects_or_be_overridden_by_n
         follow_redirects=True,
         auth=("unrelated", "credentials"),
     ) as client:
-        transport = HttpxTransport(client, token_providers={"identity": TokenManager(Provider())})
+        transport = HttpxTransport(
+            client, **authentication_adapters({"identity": TokenManager(Provider())}, None, None)
+        )
         response = await send(transport, RequestSpec("GET", "/value", security=(binding,)))
     assert response.status_code == 302
     assert sends == ["https://api.example/value"]
 
 
 @pytest.mark.anyio
-async def test_event_reconnects_share_one_authentication_recovery() -> None:
+async def test_event_rejection_has_no_hidden_authentication_retry() -> None:
     from sunday import EventStreamOptions
 
     provider = Provider()
@@ -283,7 +291,7 @@ async def test_event_reconnects_share_one_authentication_recovery() -> None:
         return httpx.Response(401, headers={"WWW-Authenticate": "Bearer error=invalid_token"})
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        transport = HttpxTransport(client, token_providers={"identity": TokenManager(provider)})
+        transport = HttpxTransport(client, **authentication_adapters({"identity": TokenManager(provider)}, None, None))
         stream = transport.event_stream(
             RequestSpec("GET", "/events", security=(BINDING,)),
             lambda event: event.data,
@@ -294,9 +302,9 @@ async def test_event_reconnects_share_one_authentication_recovery() -> None:
             async for value in stream:
                 values.append(value)
         await stream.aclose()
-    assert values == ["first"]
-    assert authorization == ["Bearer access-1", "Bearer renewed-1", "Bearer renewed-1"]
-    assert provider.refreshes == ["refresh-first"]
+    assert values == []
+    assert authorization == ["Bearer access-1"]
+    assert provider.refreshes == []
 
 
 @pytest.mark.anyio
@@ -317,7 +325,7 @@ async def test_event_reconnects_after_temporary_token_outage() -> None:
             lambda _: httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content="data: recovered\n\n")
         ),
     ) as client:
-        transport = HttpxTransport(client, token_providers={"identity": TokenManager(provider)})
+        transport = HttpxTransport(client, **authentication_adapters({"identity": TokenManager(provider)}, None, None))
         stream = transport.event_stream(
             RequestSpec("GET", "/events", security=(BINDING,)),
             lambda event: event.data,
@@ -345,11 +353,13 @@ async def test_borrowed_default_authorization_is_not_an_unselected_credential() 
         transport=httpx.MockTransport(handle),
         headers={"Authorization": "Bearer ambient"},
     ) as client:
-        transport = HttpxTransport(client, token_providers={"identity": TokenManager(Provider())})
+        transport = HttpxTransport(
+            client, **authentication_adapters({"identity": TokenManager(Provider())}, None, None)
+        )
         await send(transport, RequestSpec("GET", "/managed", security=(binding,)))
         await send(transport, RequestSpec("GET", "/unmanaged"))
         assert client.headers["authorization"] == "Bearer ambient"
-        with pytest.raises(TokenProviderError):
+        with pytest.raises(RequestCancellationError):
             await send(
                 transport,
                 RequestSpec("GET", "/managed", security=(binding,), headers=(("Authorization", "Bearer explicit"),)),
@@ -373,7 +383,7 @@ async def test_credentials_are_acquired_once_at_export_without_hidden_reauthoriz
     async with httpx.AsyncClient(
         base_url="https://api.example", transport=httpx.MockTransport(lambda _: httpx.Response(204))
     ) as client:
-        transport = HttpxTransport(client, token_providers={"identity": TokenManager(provider)})
+        transport = HttpxTransport(client, **authentication_adapters({"identity": TokenManager(provider)}, None, None))
         native = await transport.transport_request(RequestSpec("GET", "/value", security=(BINDING,)))
         assert provider.configurations == provider.acquisitions == 1
         await transport.transport_response(native)
@@ -412,7 +422,7 @@ async def test_external_provider_observes_rotation_logout_and_rejection_without_
         return httpx.Response(204)
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        transport = HttpxTransport(client, token_providers={"identity": provider})
+        transport = HttpxTransport(client, **authentication_adapters({"identity": provider}, None, None))
         operation: Operation[None, httpx.Request, httpx.Response] = Operation(
             transport, OperationSpec(RequestSpec("GET", "/value", security=(BINDING,)), (ResponseSpec(204),))
         )
@@ -420,12 +430,14 @@ async def test_external_provider_observes_rotation_logout_and_rejection_without_
         provider.token = "replacement"
         await operation.transport_response()
         provider.token = "rejected"
+        with pytest.raises(UnexpectedResponse):
+            await operation.execute()
         await operation.execute()
         assert provider.acquisitions == 4
         assert provider.rejections == 1
         assert seen == ["Bearer first", "Bearer replacement", "Bearer rejected", "Bearer renewed"]
         provider.token = None
-        with pytest.raises(TokenProviderError):
+        with pytest.raises(RequestCancellationError):
             await operation.execute()
         assert len(seen) == 4
 
@@ -440,7 +452,7 @@ async def test_external_provider_without_rejection_support_never_replays() -> No
         return httpx.Response(401, headers={"WWW-Authenticate": "Bearer error=invalid_token"})
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        transport = HttpxTransport(client, token_providers={"identity": provider})
+        transport = HttpxTransport(client, **authentication_adapters({"identity": provider}, None, None))
         with pytest.raises(TokenRejectedError):
             await transport.execute_request(RequestSpec("GET", "/value", security=(BINDING,)))
         assert len(seen) == provider.acquisitions == 1
@@ -462,8 +474,104 @@ async def test_failed_rejection_closes_response_and_sanitizes_provider_error() -
     async with httpx.AsyncClient(
         base_url="https://api.example", transport=httpx.MockTransport(lambda _: response)
     ) as client:
-        transport = HttpxTransport(client, token_providers={"identity": FailingProvider()})
-        with pytest.raises(TokenProviderError) as failure:
+        transport = HttpxTransport(client, **authentication_adapters({"identity": FailingProvider()}, None, None))
+        with pytest.raises(RequestCancellationError) as failure:
             await transport.execute_request(RequestSpec("GET", "/value", security=(BINDING,)))
         assert "private-provider-detail" not in str(failure.value)
         assert response.is_closed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("outcome", ["response", "request_error", "status_error"])
+async def test_private_receipts_do_not_escape_export_or_diagnostics(outcome: str) -> None:
+    manager = TokenManager(Provider())
+    spec: RequestSpec[None] = RequestSpec("GET", "/value", security=(BINDING,))
+    sent: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        assert "sunday.request_context" in request.extensions
+        if outcome == "request_error":
+            raise httpx.ConnectError("offline", request=request)
+        if outcome == "status_error":
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("failed", request=request, response=response)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
+        transport = HttpxTransport(client, **authentication_adapters({"identity": manager}))
+        exported = await transport.transport_request(spec)
+        assert set(exported.extensions) == {"timeout"}
+        assert exported.headers["authorization"] == "Bearer access-1"
+        if outcome == "response":
+            diagnostic = (await transport.execute_request(spec)).request
+        else:
+            with pytest.raises(httpx.HTTPError) as caught:
+                await transport.execute_request(spec)
+            diagnostic = caught.value.request
+        assert diagnostic.headers["authorization"] == "[redacted]"
+        assert set(diagnostic.extensions) == {"timeout", "sunday.security_bindings"}
+        assert "sunday.request_context" in sent[0].extensions
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["stream", "source"])
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("factory_bindings", [False, True])
+async def test_factory_event_requests_receive_operation_bindings(
+    kind: str, configured: bool, factory_bindings: bool
+) -> None:
+    import asyncio
+
+    import anyio
+
+    from sunday import EventSourceState, EventStreamOptions
+    from sunday.httpx import (
+        HttpxEventSource,
+        HttpxEventStream,
+        StandardAuthenticationAdapter,
+        request_security_bindings,
+    )
+    from sunday.httpx.request_security_bindings import _set_request_security_bindings
+
+    provider = Provider()
+    sent: list[httpx.Request] = []
+    spec: RequestSpec[None] = RequestSpec("GET", "/value", security=None if factory_bindings else (BINDING,))
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        assert request_security_bindings(request) == (BINDING,)
+        assert request.headers["authorization"] == "Bearer access-1"
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
+        adapter = StandardAuthenticationAdapter({"identity": provider} if configured else {})
+        transport = HttpxTransport(client, request_adapter=adapter, response_adapter=adapter)
+
+        async def factory(headers: tuple[tuple[str, str], ...]) -> httpx.Request:
+            request = client.build_request("GET", "/value", headers=headers)
+            return _set_request_security_bindings(request, (BINDING,)) if factory_bindings else request
+
+        with anyio.fail_after(2):
+            if kind == "stream":
+                stream: HttpxEventStream[None] = HttpxEventStream(
+                    transport, spec, lambda _: None, request_factory=factory, options=EventStreamOptions(retry=0)
+                )
+                if configured:
+                    assert [event async for event in stream] == []
+                else:
+                    with pytest.raises(RequestCancellationError):
+                        _ = [event async for event in stream]
+            else:
+                errors: list[BaseException | None] = []
+                source = HttpxEventSource(transport, factory, spec=spec, options=EventStreamOptions(retry=0))
+                source.on_error = errors.append
+                source.connect()
+                while source.ready_state is not EventSourceState.CLOSED:
+                    await asyncio.sleep(0)
+                source.close()
+                await source._wait_closed()
+                assert len(errors) == (0 if configured else 1)
+                if errors:
+                    assert isinstance(errors[0], RequestCancellationError)
+        assert len(sent) == (1 if configured else 0)

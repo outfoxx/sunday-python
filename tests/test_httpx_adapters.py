@@ -41,9 +41,9 @@ from sunday.httpx import (
     RequestAdapters,
     ResponseAdapter,
     ResponseAdapters,
+    authentication_adapters,
     copy_request,
 )
-from sunday.httpx._security import AuthenticationRecoveryBudget, RequestSecurity
 
 pytestmark = pytest.mark.anyio
 
@@ -86,8 +86,6 @@ async def perform(transport: HttpxTransport, streaming: bool, spec: RequestSpec[
     request = await transport._prepare_request(spec)
     response = await transport._send_event_stream(
         request,
-        recovery_budget=AuthenticationRecoveryBudget(),
-        security=RequestSecurity(spec.security) if spec.security is not None else None,
     )
     try:
         await response.aread()
@@ -344,9 +342,9 @@ class Provider:
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-@pytest.mark.parametrize("method,expected", [("POST", 1), ("GET", 2)])
+@pytest.mark.parametrize("method,expected", [("POST", 1), ("GET", 1)])
 @pytest.mark.parametrize("rewrite", [False, True])
-async def test_feedback_is_independent_of_retry_budget_and_matches_wire_token(
+async def test_feedback_does_not_retry_and_matches_wire_token(
     streaming: bool,
     method: str,
     expected: int,
@@ -370,7 +368,7 @@ async def test_feedback_is_independent_of_retry_budget_and_matches_wire_token(
             lambda _: httpx.Response(401, headers={"WWW-Authenticate": "Bearer error=invalid_token"})
         ),
     ) as client:
-        transport = HttpxTransport(client, token_providers={"identity": provider}, response_adapter=observe)
+        transport = HttpxTransport(client, **authentication_adapters({"identity": provider}, None, observe))
         response = await perform(transport, streaming, RequestSpec(method, "/value", security=(BINDING,)))
         assert response.status_code == 401
     assert provider.acquisitions == expected
@@ -444,7 +442,9 @@ async def test_secured_execution_never_sanitizes_stop_errors(streaming: bool, st
         ),
     ) as client:
         transport = HttpxTransport(
-            client, token_providers={"identity": StoppingProvider()}, observers=(FailingObserver(),)
+            client,
+            observers=(FailingObserver(),),
+            **authentication_adapters({"identity": StoppingProvider()}, None, None),
         )
         spec = RequestSpec(
             "POST", "/value", security=(BINDING,), body=StreamingBody(content) if stage == "upload" else None
@@ -865,9 +865,7 @@ async def test_managed_errors_sanitize_diagnostics_without_rewriting_stop_errors
         return response
 
     async with httpx.AsyncClient(base_url="https://api.example", transport=httpx.MockTransport(handle)) as client:
-        transport = HttpxTransport(
-            client, request_adapter=adapt_request, response_adapter=adapt, token_providers={"identity": provider}
-        )
+        transport = HttpxTransport(client, **authentication_adapters({"identity": provider}, adapt_request, adapt))
         with pytest.raises(httpx.ReadError) as failure:
             await perform(transport, streaming, RequestSpec("GET", "/value", security=bindings if managed else None))
     error = failure.value
@@ -918,10 +916,7 @@ async def test_managed_adapter_and_hook_task_cancellation_keeps_identity(streami
         base_url="https://api.example", transport=httpx.MockTransport(handle), event_hooks={"response": [hook]}
     ) as client:
         transport = HttpxTransport(
-            client,
-            request_adapter=adapt_request,
-            response_adapter=adapt_response,
-            token_providers={"identity": Provider()},
+            client, **authentication_adapters({"identity": Provider()}, adapt_request, adapt_response)
         )
         with pytest.raises(asyncio.CancelledError) as failure:
             await perform(transport, streaming, RequestSpec("GET", "/value", security=(BINDING,)))
@@ -988,7 +983,7 @@ async def test_managed_status_errors_preserve_response_and_cancellation_identity
         base_url="https://api.example", transport=httpx.MockTransport(handle), event_hooks={"response": [hook]}
     ) as client:
         transport = HttpxTransport(
-            client, response_adapter=adapt, token_providers={"identity": Provider()}, observers=(Observer(),)
+            client, observers=(Observer(),), **authentication_adapters({"identity": Provider()}, None, adapt)
         )
         with pytest.raises(httpx.HTTPStatusError) as failure:
             await perform(transport, streaming, RequestSpec("GET", "/value", security=bindings if managed else None))
@@ -1024,3 +1019,59 @@ async def test_managed_status_errors_preserve_response_and_cancellation_identity
         if stop:
             assert error.request is sent[0]
             assert error.response.request is sent[0]
+
+
+@pytest.mark.parametrize("stage", ["request", "send", "response"])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_unchanged_failures_preserve_their_explicit_cause(stage: str, cancel: bool) -> None:
+    cause = ValueError("application cause")
+    failure = RequestCancellationError("stopped") if cancel else RuntimeError("failed")
+
+    async def request_adapter(request: httpx.Request) -> httpx.Request:
+        if stage == "request":
+            raise failure from cause
+        return request
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        if stage == "send":
+            raise failure from cause
+        return httpx.Response(200)
+
+    async def response_adapter(response: httpx.Response, request: httpx.Request) -> httpx.Response:
+        raise failure from cause
+
+    async with (
+        httpx.AsyncClient(base_url="https://example.test", transport=httpx.MockTransport(respond)) as client,
+        HttpxTransport(client, request_adapter=request_adapter, response_adapter=response_adapter) as transport,
+    ):
+        with pytest.raises(type(failure)) as caught:
+            await transport.execute_request(RequestSpec("GET", "/value"))
+    assert caught.value is failure
+    assert caught.value.__cause__ is cause
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("status", [200, 401, 403])
+@pytest.mark.parametrize(
+    "challenge", ["Bearer error=invalid_token", "Basic error=invalid_token", "Bearer error=insufficient_scope"]
+)
+async def test_explicit_bearer_rejection_policy_preserves_bodies(method: str, status: int, challenge: str) -> None:
+    from sunday.httpx import BearerTokenRejectionAdapter
+
+    request = httpx.Request(
+        method, "https://example.test", headers={"Authorization": "Bearer fixture"}, content=b"request"
+    )
+    body = Body()
+    response = httpx.Response(status, headers={"WWW-Authenticate": challenge}, stream=body)
+    adapter = BearerTokenRejectionAdapter()
+    if status == 401 and challenge == "Bearer error=invalid_token":
+        for _ in range(2):
+            with pytest.raises(RequestCancellationError):
+                await adapter.adapt(response, request)
+    else:
+        assert await adapter.adapt(response, request) is response
+    del request.headers["Authorization"]
+    assert await adapter.adapt(response, request) is response
+    assert request.content == b"request"
+    assert body.reads == 0
+    await response.aclose()

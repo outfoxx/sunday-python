@@ -25,11 +25,10 @@ from ..media import MediaType
 from ..request_cancellation_error import RequestCancellationError
 from ..specs import RequestSpec
 from ..sse import EventParser, EventStreamOptions, ServerSentEvent
-from ..token_provider import TokenProviderError
 from ._async import complete, run_io
 from ._reconnect import _ReconnectPolicy
 from ._response_cleanup import close_response, in_response_cleanup
-from ._security import AuthenticationRecoveryBudget, RequestSecurity
+from .request_security_bindings import _set_request_security_bindings
 
 if TYPE_CHECKING:
     from ._transport import HttpxEventSourceRequestFactory, HttpxTransport
@@ -173,7 +172,6 @@ class HttpxEventStream[EventT]:
         self._close_event = anyio.Event()
         reconnect = _ReconnectPolicy(self._options.retry, self._options.retry_max)
         last_event_id: str | None = None
-        recovery_budget = AuthenticationRecoveryBudget()
 
         try:
             while not self._closed:
@@ -189,11 +187,11 @@ class HttpxEventStream[EventT]:
                         else:
                             request_value = self._request_factory(tuple(headers))
                             request = await request_value if inspect.isawaitable(request_value) else request_value
+                            if self._spec.security is not None:
+                                _set_request_security_bindings(request, self._spec.security)
                         self._disable_httpx_read_timeout(request)
                         response = await self._transport._send_event_stream(
                             request,
-                            recovery_budget=recovery_budget,
-                            security=RequestSecurity(self._spec.security) if self._spec.security is not None else None,
                         )
                         self._response = response
 
@@ -241,9 +239,7 @@ class HttpxEventStream[EventT]:
                                     return
                 except RequestCancellationError:
                     raise
-                except (httpx.TransportError, TimeoutError, TokenProviderError) as error:
-                    if isinstance(error, TokenProviderError) and error.reason != "temporary":
-                        raise
+                except (httpx.TransportError, TimeoutError) as error:
                     if self._closed:
                         return
                     if self._on_error is not None:
