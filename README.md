@@ -288,6 +288,47 @@ is a typed, copyable, picklable singleton; it is omitted from JSON Schema and se
 field configuration above. A literal string `"UNSET"` remains an ordinary string value. Keep the
 `default_factory` and `exclude_if` configuration when defining patch models manually.
 
+## Explicit standard authentication
+
+Choose standard authentication once in the transport factory supplied to generated clients.
+`StandardAuthenticationAdapter` composes credential attachment, missing-provider checks, rejection
+feedback, and terminal bearer-rejection cancellation. It delegates to the existing adapters, including
+their body ownership rules, and ignores public/detached operation responses. Feedback runs before
+cancellation. There is no hidden replay; a later explicit request can obtain renewed credentials.
+
+The standard settings helper selects this policy on both sides. Lower-level `AuthenticationAdapter`
+remains available when an application wants feedback without the standard stop policy. Ordinary
+transport constructors perform no authentication and do not install this composition.
+
+```python
+from sunday.httpx import HttpxTransport, transport_from_settings
+
+# Keep the HTTPX client open for the lifetime of the generated clients.
+async with httpx.AsyncClient(base_url=base_url) as client:
+    def standard_factory(settings):
+        return transport_from_settings(settings, client)
+
+    # Pass standard_factory to the generated configuration-based factory,
+    # or construct a generated service with this caller-owned transport:
+    custom_transport = HttpxTransport(
+        client, request_adapter=auth0_link, response_adapter=auth0_link,
+    )
+```
+
+Caching is a separate explicit choice: construct `TokenManager` around a Sunday OAuth provider and
+supply that manager through provider credentials to the generated factory. This retains expiry renewal,
+refresh rotation, and application-selected storage. A provider returned by an OAuth credential factory
+can likewise be an explicitly constructed manager. Supplied external providers are used unchanged;
+standard composition never wraps them, creates a second cache, closes them, or clears their storage.
+Keep managers at application/session scope, share them across clients using the same credential lifecycle,
+and settle outstanding requests before closing managers or clearing credentials.
+
+Static bearer, basic, and API-key credentials use their declared placement without an OAuth cache.
+Only an explicit Bearer `invalid_token` challenge for a sent bearer credential invokes the bearer stop
+policy; 403s and unrelated challenges retain ordinary response handling. Authentication selection and
+credential validation in generated settings remain active for the standard path. The direct-transport
+path lets a custom adapter own those choices using operation metadata.
+
 ## Application-owned token lifecycle
 
 Transport constructors perform no authentication or authorization by default. They accept request and response
@@ -307,7 +348,7 @@ recovery policy, and a cancellation-marked error always stops the exchange, retr
 An external framework (for example Auth0) remains responsible for storage, renewal and logout.
 Return only its access token and optional expiry; keep its refresh token inside that framework.
 
-The provider-settings convenience `transport_from_settings(...)` explicitly installs provider adapters.
+The provider-settings convenience `transport_from_settings(...)` explicitly installs the standard authentication composition.
 Use the ordinary transport constructor with your own adapters when you want to own the exchange entirely.
 
 For Sunday's caching and refresh lifecycle, explicitly supply a `TokenManager` as the provider:

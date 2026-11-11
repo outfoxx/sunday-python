@@ -24,6 +24,7 @@ try:
     from .request_adapter import RequestAdapter, RequestAdapters
     from .request_security_bindings import request_security_bindings
     from .response_adapter import ResponseAdapter, ResponseAdapters
+    from .standard_authentication_adapter import StandardAuthenticationAdapter
 except ModuleNotFoundError as error:
     if error.name not in {"anyio", "httpx"}:
         raise
@@ -44,6 +45,7 @@ __all__ = [
     "RequestAdapters",
     "ResponseAdapter",
     "ResponseAdapters",
+    "StandardAuthenticationAdapter",
     "authentication_adapters",
     "copy_request",
     "request_security_bindings",

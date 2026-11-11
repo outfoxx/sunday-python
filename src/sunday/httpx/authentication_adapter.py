@@ -92,9 +92,12 @@ def authentication_adapters(
 
 
 def transport_from_settings(settings: ClientSettings, client: httpx.AsyncClient) -> "HttpxTransport":
-    """Compose provider adapters from client settings using a caller-owned HTTPX client."""
+    """Select standard attachment, rejection feedback, and cancellation using caller-owned providers/client."""
     from ._transport import HttpxTransport
 
     if str(client.base_url).rstrip("/") != str(httpx.URL(settings.base_url)).rstrip("/"):
         raise ValueError("HTTPX client base URL must match resolved settings")
-    return HttpxTransport(client, **authentication_adapters(settings.token_providers))
+    from .standard_authentication_adapter import StandardAuthenticationAdapter
+
+    authentication = StandardAuthenticationAdapter(settings.token_providers)
+    return HttpxTransport(client, request_adapter=authentication, response_adapter=authentication)
