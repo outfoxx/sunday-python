@@ -1023,21 +1023,21 @@ async def test_managed_status_errors_preserve_response_and_cancellation_identity
 
 @pytest.mark.parametrize("stage", ["request", "send", "response"])
 @pytest.mark.parametrize("cancel", [False, True])
-async def test_unchanged_failures_preserve_their_explicit_cause(stage, cancel):
+async def test_unchanged_failures_preserve_their_explicit_cause(stage: str, cancel: bool) -> None:
     cause = ValueError("application cause")
     failure = RequestCancellationError("stopped") if cancel else RuntimeError("failed")
 
-    async def request_adapter(request):
+    async def request_adapter(request: httpx.Request) -> httpx.Request:
         if stage == "request":
             raise failure from cause
         return request
 
-    async def respond(request):
+    async def respond(request: httpx.Request) -> httpx.Response:
         if stage == "send":
             raise failure from cause
         return httpx.Response(200)
 
-    async def response_adapter(response, request):
+    async def response_adapter(response: httpx.Response, request: httpx.Request) -> httpx.Response:
         raise failure from cause
 
     async with (
@@ -1055,7 +1055,7 @@ async def test_unchanged_failures_preserve_their_explicit_cause(stage, cancel):
 @pytest.mark.parametrize(
     "challenge", ["Bearer error=invalid_token", "Basic error=invalid_token", "Bearer error=insufficient_scope"]
 )
-async def test_explicit_bearer_rejection_policy_preserves_bodies(method, status, challenge):
+async def test_explicit_bearer_rejection_policy_preserves_bodies(method: str, status: int, challenge: str) -> None:
     from sunday.httpx import BearerTokenRejectionAdapter
 
     request = httpx.Request(
