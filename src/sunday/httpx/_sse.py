@@ -22,6 +22,7 @@ import httpx
 from ..errors import TransportError, UnexpectedResponse
 from ..event_source import EventSourceErrorHandler, EventSourceMessageHandler, EventSourceOpenHandler, EventSourceState
 from ..media import MediaType
+from ..problems import Problem
 from ..request_cancellation_error import RequestCancellationError
 from ..specs import RequestSpec
 from ..sse import EventParser, EventStreamOptions, ServerSentEvent
@@ -239,7 +240,12 @@ class HttpxEventStream[EventT]:
                                     return
                 except RequestCancellationError:
                     raise
-                except (httpx.TransportError, TimeoutError) as error:
+                except (httpx.TransportError, TimeoutError, Problem, UnexpectedResponse) as error:
+                    # Only failed HTTP admission is retryable; decoder/media failures remain terminal.
+                    if isinstance(error, (Problem, UnexpectedResponse)) and (
+                        connected or response is None or response.status_code not in {408, 429, 500, 502, 503, 504}
+                    ):
+                        raise
                     if self._closed:
                         return
                     if self._on_error is not None:
