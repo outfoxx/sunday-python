@@ -16,6 +16,7 @@ from sunday import (
     EventSourceState,
     EventStreamOptions,
     Problem,
+    ProblemPayload,
     RequestCancellationError,
     RequestEncodingError,
     RequestSpec,
@@ -842,3 +843,116 @@ async def test_early_stream_exit_releases_native_connection_before_client_close(
                     await iterator.aclose()
         finally:
             group.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+@pytest.mark.parametrize("problem_body", [False, True])
+async def test_temporary_http_recovery_preserves_cursor_and_closes_responses(status: int, problem_body: bool) -> None:
+    requests: list[httpx.Request] = []
+    responses: list[httpx.Response] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            response = httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=Chunks(b"retry: 1\nretry-max: 5\nid: checkpoint\ndata: before\n\n"),
+            )
+        elif len(requests) == 2:
+            response = (
+                httpx.Response(
+                    status,
+                    headers={"Content-Type": "application/problem+json"},
+                    json={"title": "Unavailable", "status": 400},
+                )
+                if problem_body
+                else httpx.Response(status, stream=Chunks(b"temporarily unavailable"))
+            )
+        elif len(requests) == 3:
+            response = httpx.Response(
+                200, headers={"Content-Type": "text/event-stream"}, stream=Chunks(b"data: after\n\n")
+            )
+        else:
+            response = httpx.Response(204)
+        responses.append(response)
+        return response
+
+    async with httpx.AsyncClient(base_url="https://api.example.test", transport=httpx.MockTransport(handler)) as client:
+        stream = HttpxTransport(client).event_stream(RequestSpec("GET", "/events"), lambda event: event.data)
+        with anyio.fail_after(1):
+            assert [value async for value in stream] == ["before", "after"]
+
+    assert len(requests) == 4
+    assert "last-event-id" not in requests[0].headers
+    assert [request.headers["last-event-id"] for request in requests[1:]] == ["checkpoint"] * 3
+    assert all(response.is_closed for response in responses)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 501])
+async def test_permanent_http_response_does_not_reconnect(status: int) -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            status, headers={"Content-Type": "application/problem+json"}, json={"title": "Denied", "status": 503}
+        )
+
+    async with httpx.AsyncClient(base_url="https://api.example.test", transport=httpx.MockTransport(handler)) as client:
+        stream = HttpxTransport(client).event_stream(RequestSpec("GET", "/events"), lambda event: event)
+        with anyio.fail_after(1), pytest.raises(Problem):
+            _ = [value async for value in stream]
+    assert attempts == 1
+
+
+@pytest.mark.anyio
+async def test_temporary_http_error_callback_can_stop_recovery() -> None:
+    attempts = 0
+    errors: list[BaseException | None] = []
+    body = Chunks(b"temporarily unavailable")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, stream=body)
+
+    async with httpx.AsyncClient(base_url="https://api.example.test", transport=httpx.MockTransport(handler)) as client:
+        source = HttpxTransport(client).event_source(RequestSpec("GET", "/events"))
+
+        def stop(error: BaseException | None) -> None:
+            errors.append(error)
+            assert source.ready_state is not EventSourceState.CLOSED
+            source.close()
+
+        source.on_error = stop
+        source.connect()
+        with anyio.fail_after(1):
+            await source._wait_closed()
+    assert attempts == 1
+    assert len(errors) == 1 and isinstance(errors[0], UnexpectedResponse)
+    assert body.closed
+
+
+@pytest.mark.anyio
+async def test_decoder_problem_is_not_a_retryable_http_failure() -> None:
+    attempts = 0
+    error = Problem(ProblemPayload(title="Decoder failed", status=503))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=Chunks(b"data: bad\n\n"))
+
+    def decode(_event: object) -> str:
+        raise error
+
+    async with httpx.AsyncClient(base_url="https://api.example.test", transport=httpx.MockTransport(handler)) as client:
+        stream = HttpxTransport(client).event_stream(RequestSpec("GET", "/events"), decode)
+        with pytest.raises(Problem) as raised:
+            _ = [value async for value in stream]
+    assert raised.value is error
+    assert attempts == 1
